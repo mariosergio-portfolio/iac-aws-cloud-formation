@@ -1,0 +1,160 @@
+Product: webstore   (split into 2 microservices: webstore-catalog, webstore-cart)
+Naming convention: ${Environment}-${ProductName}-${AppServiceName}-<resource>
+Stack naming convention: <env>-<product>[-<service>]-<layer>
+
+================================================================================
+SHARED  (deployed ONCE per environment — used by both services)
+================================================================================
+
+CloudFormation stack: dev-webstore-vpc                         [aws-vpc-stack.yml]
+│
+└─ Networking
+    ├─ VPC (10.0.0.0/16)
+    ├─ Internet Gateway  → attached to VPC
+    ├─ Public subnets (A, B)  → Public route table → IGW
+    ├─ Private subnets (A, B) → Private route table → NAT Gateway
+    ├─ NAT Gateway  → sits in Public subnet A
+    ├─ Security group: ALB  → allows 80 from 0.0.0.0/0
+    └─ Security group: ECS  → allows 8080 from ALB security group only
+
+CloudFormation stack: dev-webstore-ecs-infra                    [aws-ecs-infra-stack.yml]
+│
+└─ Shared compute + load balancing
+    ├─ ECS Cluster (dev-webstore-cluster)                       ← shared by every service's tasks
+    ├─ Application Load Balancer  → internet-facing, public subnets
+    └─ ALB Listener (port 80)  → default action: 404 fixed response
+        (each per-service stack below attaches its own path-based
+         ListenerRule: /catalog/*, /cart/*)
+
+================================================================================
+PER SERVICE  (deployed TWICE per environment — once with AppServiceName=catalog,
+              once with AppServiceName=cart. Stack names and every resource below
+              are namespaced per service; nothing in this block is shared.)
+================================================================================
+
+┌────────────────────────────── webstore-catalog ──────────────────────────────┐
+
+CloudFormation stack: dev-webstore-catalog-iam                  [aws-iam-stack.yml]        (per service)
+│
+└─ IAM
+    ├─ ECS Task Execution Role  → pulls image from ECR, writes logs
+    └─ ECS Task Role            → app's own runtime permissions
+
+CloudFormation stack: dev-webstore-catalog-codebuild            [aws-codebuild-stack.yml]  (per service)
+│
+└─ Build pipeline
+    ├─ ECR repository            (dev-webstore-catalog-repo)
+    ├─ CodeBuild log group
+    ├─ CodeBuild service role  → ECR push, logs, CodeConnections
+    └─ CodeBuild project         (dev-webstore-catalog-codebuild)
+        → GitHub source (webstore-catalog repo/path) → docker build → push to ECR
+
+CloudFormation stack: dev-webstore-catalog-pipeline              [aws-pipeline-stack.yml]  (per service)
+│
+└─ Auto-deploy trigger
+    ├─ EventBridge rule  → fires on "CodeBuild Build State Change" = SUCCEEDED,
+    │                       filtered to dev-webstore-catalog-codebuild only
+    ├─ Lambda: dev-webstore-catalog-deploy-trigger  (Python 3.12, 60s timeout)
+    │   ├─ reads IMAGE_TAG from the build's exportedEnvironmentVariables
+    │   ├─ describes current task definition (family: dev-webstore-catalog-task), swaps the image tag
+    │   ├─ registers a new task definition revision
+    │   ├─ calls ecs:UpdateService on dev-webstore-catalog-service, forceNewDeployment: true
+    │   └─ writes the new tag to SSM /dev-webstore-catalog-imageTag (source of truth, avoids CFN drift)
+    ├─ Lambda execution role  → scoped: logs, dev-webstore-catalog-codebuild project only,
+    │                            ECS describe/register/update on dev-webstore-catalog-service only,
+    │                            the one catalog SSM param, iam:PassRole (ecs-tasks.amazonaws.com only)
+    └─ Lambda log group  → /aws/lambda/dev-webstore-catalog-deploy-trigger, 14-day retention
+
+CloudFormation stack: dev-webstore-catalog-service               [aws-ecs-service-stack.yml] (per service)
+│
+├─ Compute
+│   └─ ECS Service (dev-webstore-catalog-service)  → runs on the SHARED dev-webstore-cluster
+│       ├─ DesiredCount: 3, MinHealthy: 50%, MaxPercent: 200%
+│       ├─ Deployment circuit breaker: enabled, rollback: true
+│       ├─ Task 1
+│       ├─ Task 2
+│       └─ Task 3
+│
+└─ Load balancing
+    ├─ Target group (dev-webstore-catalog-tg)  → health check GET /actuator/health, 30s interval
+    └─ ALB Listener Rule  → path /catalog/*  → forwards to dev-webstore-catalog-tg
+                             (attached to the SHARED ALB Listener from ecs-infra stack)
+
+Config
+└─ SSM Parameter  → /dev-webstore-catalog-imageTag  (written by the catalog pipeline Lambda)
+
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────── webstore-cart ────────────────────────────────┐
+
+CloudFormation stack: dev-webstore-cart-iam                     [aws-iam-stack.yml]        (per service)
+│
+└─ IAM
+    ├─ ECS Task Execution Role  → pulls image from ECR, writes logs
+    └─ ECS Task Role            → app's own runtime permissions
+
+CloudFormation stack: dev-webstore-cart-codebuild                [aws-codebuild-stack.yml]  (per service)
+│
+└─ Build pipeline
+    ├─ ECR repository            (dev-webstore-cart-repo)
+    ├─ CodeBuild log group
+    ├─ CodeBuild service role  → ECR push, logs, CodeConnections
+    └─ CodeBuild project         (dev-webstore-cart-codebuild)
+        → GitHub source (webstore-cart repo/path) → docker build → push to ECR
+
+CloudFormation stack: dev-webstore-cart-pipeline                 [aws-pipeline-stack.yml]  (per service)
+│
+└─ Auto-deploy trigger
+    ├─ EventBridge rule  → fires on "CodeBuild Build State Change" = SUCCEEDED,
+    │                       filtered to dev-webstore-cart-codebuild only
+    ├─ Lambda: dev-webstore-cart-deploy-trigger  (Python 3.12, 60s timeout)
+    │   ├─ reads IMAGE_TAG from the build's exportedEnvironmentVariables
+    │   ├─ describes current task definition (family: dev-webstore-cart-task), swaps the image tag
+    │   ├─ registers a new task definition revision
+    │   ├─ calls ecs:UpdateService on dev-webstore-cart-service, forceNewDeployment: true
+    │   └─ writes the new tag to SSM /dev-webstore-cart-imageTag (source of truth, avoids CFN drift)
+    ├─ Lambda execution role  → scoped: logs, dev-webstore-cart-codebuild project only,
+    │                            ECS describe/register/update on dev-webstore-cart-service only,
+    │                            the one cart SSM param, iam:PassRole (ecs-tasks.amazonaws.com only)
+    └─ Lambda log group  → /aws/lambda/dev-webstore-cart-deploy-trigger, 14-day retention
+
+CloudFormation stack: dev-webstore-cart-service                  [aws-ecs-service-stack.yml] (per service)
+│
+├─ Compute
+│   └─ ECS Service (dev-webstore-cart-service)  → runs on the SHARED dev-webstore-cluster
+│       ├─ DesiredCount: 5, MinHealthy: 50%, MaxPercent: 200%
+│       ├─ Deployment circuit breaker: enabled, rollback: true
+│       ├─ Task 1
+│       ├─ Task 2
+│       └─ Task 3
+│       └─ Task 4
+│       └─ Task 5
+
+└─ Load balancing
+    ├─ Target group (dev-webstore-cart-tg)  → health check GET /actuator/health, 30s interval
+    └─ ALB Listener Rule  → path /cart/*  → forwards to dev-webstore-cart-tg
+                             (attached to the SHARED ALB Listener from ecs-infra stack)
+
+Config
+└─ SSM Parameter  → /dev-webstore-cart-imageTag  (written by the cart pipeline Lambda)
+
+└────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+Deploy order
+================================================================================
+1. dev-webstore-vpc                (shared, once)
+2. dev-webstore-ecs-infra           (shared, once — imports VPC stack outputs)
+3. For EACH service (catalog, cart), in this order:
+   a. dev-webstore-<service>-iam
+   b. dev-webstore-<service>-codebuild
+   c. dev-webstore-<service>-service    (imports vpc + ecs-infra + iam + codebuild outputs)
+   d. dev-webstore-<service>-pipeline   (imports codebuild + service outputs)
+
+Templates referenced above:
+  cloudFormation/generic/aws-vpc-stack.yml
+  cloudFormation/generic/aws-ecs-infra-stack.yml
+  cloudFormation/generic/per-service/aws-iam-stack.yml
+  cloudFormation/generic/per-service/aws-codebuild-stack.yml
+  cloudFormation/generic/per-service/aws-ecs-service-stack.yml
+  cloudFormation/generic/per-service/aws-pipeline-stack.yml

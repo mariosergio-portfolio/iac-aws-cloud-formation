@@ -188,7 +188,7 @@ show a `*_COMPLETE` status.
 The two product-tier stacks are shared. A second microservice would add its own five service-tier stacks
 next to these, named `dev-portfolio-<service>-…`.
 
-![AWS CloudFormation console listing the seven dev-portfolio stacks, all in a COMPLETE status](aws-cloud-formation-web-console.png)
+![AWS CloudFormation console listing the seven dev-portfolio stacks, all in a COMPLETE status](docs/aws-cloud-formation-web-console.png)
 
 ### First deploy of a service
 
@@ -207,14 +207,14 @@ next to these, named `dev-portfolio-<service>-…`.
    ```powershell
    aws ecs update-service --cluster "$StackPrefix-cluster" `
      --service "$StackPrefix-$AppServiceName-service" `
-     --desired-count 1 --force-new-deployment
+     --desired-count 3 --force-new-deployment
    ```
 
    The screenshot below is the result of this step in the `dev` / `portfolio` / `webstore` example: the
    ECS console for `dev-portfolio-cluster`, where the service tasks are **Running** as Fargate tasks
    (here 3 running, 0 pending) from task definition `dev-portfolio-webstore-task`.
 
-   ![ECS console for dev-portfolio-cluster listing the webstore Fargate tasks in a Running state](ecs-fargate-instances.png)
+   ![ECS console for dev-portfolio-cluster listing the webstore Fargate tasks in a Running state](docs/ecs-fargate-instances.png)
 
 After that, every successful CodeBuild build redeploys the service automatically.
 
