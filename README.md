@@ -1,187 +1,255 @@
-# Webstore REST API (Java / Spring)
+# Generic AWS CloudFormation — ECS Fargate Microservices
 
-Web Store REST API — **Catalog module** (Products + Categories), built with **Java 25 / Spring Boot 4.1** following **Hexagonal Architecture (Ports & Adapters)**.
+Reusable, parameter-driven **AWS CloudFormation** templates to host one or many containerized
+microservices on **ECS Fargate**, with a shared network and load balancer, a per-service
+CI/CD pipeline, and an optional per-service **Aurora PostgreSQL** database.
 
-- Group/Artifact: `com.mycompany` / `webstore-java`
-- Base package: `com.mycompany.webstore`
-- GitHub: https://github.com/mariosergio30/webstore-java-api
-
----
-
-Swagger UI: `http://localhost:8080/swagger-ui.html`
+Nothing is product-specific: every name is derived from three parameters —
+`Environment`, `ProductName` and `AppServiceName` — so the same templates can be reused for any
+product, environment (`dev` / `staging` / `prod`) and service.
 
 ---
 
-## Architecture: Hexagonal (Ports & Adapters)
+## What you get
 
-Requests flow **in** through a driving adapter (REST controller), cross an **input port**
-into the application core, and any persistence need flows **out** through an **output port**
-to a driven adapter (JPA). The domain model at the center has zero framework dependencies —
-no Spring, no JPA, no Lombok.
-
-```
-                              ┌─────────────────────────────┐
-                              │      HTTP client / caller    │
-                              └───────────────┬───────────────┘
-                                              │ JSON
-                                              ▼
-                              ┌─────────────────────────────┐
-   DRIVING ADAPTER            │      ProductController       │  infrastructure/rest/catalog
-   (infrastructure/rest)      │  (ProductRequest/Response,   │
-                              │   ProductRestMapper)         │
-                              └───────────────┬───────────────┘
-                                              │ implements
-                                              ▼
-   INPUT PORT                  ┌─────────────────────────────┐
-   (application/port/in)       │      ProductPort  (interface)│  application/port/in
-                              └───────────────┬───────────────┘
-                                              │
-                                              ▼
-   APPLICATION SERVICE         ┌─────────────────────────────┐
-   (application/service)       │      ProductPortImpl         │  business rules,
-                              │  (use cases, validations)    │  UUIDs, timestamps
-                              └───────────────┬───────────────┘
-                                              │ depends on
-                                              ▼
-   DOMAIN MODEL                 ┌─────────────────────────────┐
-   (domain/model)              │   Product / Category          │  plain Java,
-                              │   (archive(), isActive()...)  │  no framework deps
-                              └───────────────┬───────────────┘
-                                              │ persisted via
-                                              ▼
-   OUTPUT PORT                  ┌─────────────────────────────┐
-   (application/port/out)       │   ProductRepository (interface)│ application/port/out
-                              └───────────────┬───────────────┘
-                                              │ implements
-                                              ▼
-   DRIVEN ADAPTER                ┌─────────────────────────────┐
-   (infrastructure/persistence) │ ProductPersistenceAdapterImpl │
-                              │ (ProductPersistenceMapper)    │
-                              └───────────────┬───────────────┘
-                                              │ Domain ↔ JPA entity
-                                              ▼
-                              ┌─────────────────────────────┐
-                              │  ProductJpaRepository          │  Spring Data JPA
-                              │  → ProductJpaEntity → DB       │  (H2 dev / PostgreSQL prod)
-                              └─────────────────────────────┘
-```
-
-**Rules enforced across the codebase:**
-
-- Domain objects (`domain/model/`) never depend on Spring, JPA, or Lombok.
-- Application services depend only on port interfaces and domain objects — never on JPA entities or HTTP types.
-- JPA entities live exclusively in `infrastructure/persistence/entity/` and never cross into domain/application.
-- A `RestMapper` and a `PersistenceMapper` (both MapStruct, `componentModel = "spring"`) sit at each boundary.
-- Controllers inject the **input port interface**, never the service implementation directly.
+| Concern | Provided by |
+|---|---|
+| Network (VPC, 2 public + 2 private subnets, IGW, NAT, security groups) | `aws-vpc-stack.yml` |
+| Shared ECS cluster + internet-facing Application Load Balancer | `aws-ecs-infra-stack.yml` |
+| Docker build from GitHub → ECR (immutable tags, scan on push) | `per-service/aws-codebuild-stack.yml` |
+| ECS task execution role + task role | `per-service/aws-iam-stack.yml` |
+| Aurora PostgreSQL Serverless v2, managed secret, subnet group, SG | `per-service/aws-rds-aurora-stack.yml` |
+| Task definition, ECS service, target group, ALB path rule | `per-service/aws-ecs-service-stack.yml` |
+| Auto-redeploy on every successful build (EventBridge + Lambda) | `per-service/aws-pipeline-stack.yml` |
 
 ---
 
-### REST API
-![img.png](doc/swagger-api-img.png)
+## Architecture
+
+Infrastructure has two tiers. The **product tier** is deployed once per environment; the
+**service tier** is deployed once per microservice and shares everything in the product tier.
+
+```
+PRODUCT TIER (once per product × environment)
+  vpc        → VPC, subnets, IGW, NAT Gateway, sg-alb, sg-ecs
+  ecs-infra  → ECS cluster + ALB + HTTP :80 listener (default action: 404)
+
+SERVICE TIER (once per microservice × environment)
+  codebuild    → ECR repository + CodeBuild project (GitHub → Docker → ECR)
+  iam          → ECS task execution role + task role
+  rds          → Aurora PostgreSQL cluster + secret (optional, if the service needs a DB)
+  ecs-service  → task definition + ECS service + target group + ALB rule  /<AppServiceName>/*
+  pipeline     → EventBridge rule + Lambda that redeploys the service after a build
+```
+
+```
+Internet
+   │
+   ▼
+ALB (public subnets, HTTP :80)
+   ├── /catalog/*  → Target group → ECS service "catalog"  ─┐
+   ├── /orders/*   → Target group → ECS service "orders"   ─┼─► Fargate tasks (private subnets)
+   └── anything else → 404                                  ─┘        │ outbound via NAT
+                                                                      ▼
+                                                        Aurora PostgreSQL (per service)
+```
+
+```
+Delivery flow (per service)
+
+GitHub ──► CodeBuild ──► ECR
+              │ build SUCCEEDED
+              ▼
+        EventBridge ──► Lambda ──► new task definition revision ──► ECS service (rolling redeploy)
+                          ▲
+                          └── image tag read from SSM Parameter Store
+```
+
+### Design decisions
+
+- **Shared cluster and ALB, path-based routing.** Each service is reachable at `/<AppServiceName>/*`
+  and needs a unique `ListenerRulePriority`. The app must run with
+  `server.servlet.context-path=/<AppServiceName>`.
+- **Image tag lives in SSM, not in the template.** The task definition resolves
+  `<ecr-uri>:{{resolve:ssm:/<env>-<product>-<service>-imageTag}}`. There is no `ImageTag`
+  parameter on the service stack.
+- **`DesiredCount` defaults to `0`.** CloudFormation creates the service without starting tasks;
+  you start and scale them explicitly (see [Operations](#operations)).
+- **Task definitions are retained** (`DeletionPolicy: Retain`) so old revisions stay available for rollback.
+- **Tasks run in private subnets** with `awsvpc` networking and target type `ip`; only the ALB is public.
+- **No plaintext secrets.** The database password is generated and stored in Secrets Manager;
+  the task receives `DB_HOST`, `DB_PORT`, `DB_NAME` and the secret reference.
+- **Stacks are wired with `Fn::ImportValue` / `Outputs.Export`**, never copied ARNs.
+- **Aurora keeps a final snapshot** on delete (`DeletionPolicy: Snapshot`).
 
 ---
-Base path: `/api`
 
-| Method | Path | Description |
+## Repository layout
+
+```
+cloud-formation/
+├── aws-vpc-stack.yml               # product tier: network
+├── aws-ecs-infra-stack.yml         # product tier: ECS cluster + ALB
+├── RUN-STACK-INSTRUCTIONS.md       # full deploy / operate command reference (PowerShell)
+└── per-service/
+    ├── aws-codebuild-stack.yml     # ECR + CodeBuild
+    ├── aws-iam-stack.yml           # ECS roles
+    ├── aws-rds-aurora-stack.yml    # Aurora PostgreSQL Serverless v2
+    ├── aws-ecs-service-stack.yml   # task definition, service, target group, ALB rule
+    └── aws-pipeline-stack.yml      # auto-redeploy on build success
+```
+
+---
+
+## Naming conventions
+
+| Item | Pattern | Example (`dev`, `shop`, `catalog`) |
 |---|---|---|
-| GET | `/api/products` | List/search (`q`, `categoryId`, `minPrice`, `maxPrice`, `status`, pagination) |
-| GET | `/api/products/{id}` | Get by UUID |
-| POST | `/api/products` | Create (status → DRAFT) |
-| PUT | `/api/products/{id}` | Full update (SKU immutable) |
-| PATCH | `/api/products/{id}` | Partial update (null fields skipped) |
-| DELETE | `/api/products/{id}` | Archive (soft-delete) |
-| GET/POST/PUT | `/api/categories[/{id}]` | Category CRUD |
-| DELETE | `/api/categories/{id}` | Hard delete (blocked if products reference it) |
+| Stack (product tier) | `<env>-<product>-<tier>` | `dev-shop-vpc`, `dev-shop-ecs-infra` |
+| Stack (service tier) | `<env>-<product>-<service>-<tier>` | `dev-shop-catalog-ecs-service` |
+| ECS cluster | `<env>-<product>-cluster` | `dev-shop-cluster` |
+| ECS service | `<env>-<product>-<service>-service` | `dev-shop-catalog-service` |
+| ECR repository | `<env>-<product>-<service>-repo` | `dev-shop-catalog-repo` |
+| SSM image tag | `/<env>-<product>-<service>-imageTag` | `/dev-shop-catalog-imageTag` |
+| Export names | `<env>-<product>[-<service>]-<output>` | `dev-shop-vpc-id` |
 
+---
 
-### Key libraries
+## Prerequisites
 
-| Library | Version | Purpose |
-|---|---|---|
-| Spring Boot | 4.1.0 | Framework |
-| Spring Actuator | Spring Boot managed | Health, info, metrics, loggers, mappings endpoints |
-| MapStruct | 1.6.3 | Compile-time object mapping at layer boundaries |
-| Lombok | Spring Boot managed | `provided` scope only — used in infra layer, never in domain |
-| SpringDoc OpenAPI | 2.8.9 | Swagger UI at `/swagger-ui.html`, API docs at `/v3/api-docs` |
-| JJWT | 0.13.0 | JWT dependency present — not yet wired into security filter |
-| Flyway | Spring Boot managed | DB migrations (prod only) |
-| H2 | Spring Boot managed | In-memory DB for dev |
-| PostgreSQL driver | Spring Boot managed | Production DB |
-| Testcontainers BOM | 2.0.5 | Integration test containers (future use) |
+- An AWS account and the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), authenticated (`aws login` or any profile).
+- A **GitHub CodeConnections** connection in `AVAILABLE` state (AWS Console → CodeBuild → Source credentials → GitHub → OAuth). Its ARN is passed as `GitHubConnectionArn`; the template has no default for it.
+- A `Dockerfile` and a `buildspec.yml` in the application repository (the buildspec file name is the `BuildSpecFile` parameter).
 
-### Naming conventions
+Set the shared variables once per shell session (PowerShell shown; the same values apply to any shell).
+Don't hardcode account IDs, ARNs or tokens in committed files.
 
-| Layer | Pattern | Example |
-|---|---|---|
-| Input port | `XxxPort` | `ProductPort` |
-| Output port | `XxxRepository` | `ProductRepository` |
-| Service | `XxxPortImpl` | `ProductPortImpl` |
-| Persistence adapter | `XxxPersistenceAdapterImpl` | `ProductPersistenceAdapterImpl` |
-| JPA entity | `XxxJpaEntity` | `ProductJpaEntity` |
-| JPA repository | `XxxJpaRepository` | `ProductJpaRepository` |
-| REST mapper | `XxxRestMapper` | `ProductRestMapper` |
-| Persistence mapper | `XxxPersistenceMapper` | `ProductPersistenceMapper` |
-
-### Exception handling (RFC 9457 `ProblemDetail`)
-
-| Exception | HTTP Status | Use when |
-|---|---|---|
-| `ResourceNotFoundException` | 404 | Entity not found by ID or SKU |
-| `BusinessRuleException` | 422 | Domain rule violated (duplicate SKU, price ≤ 0, self-parent, etc.) |
-| `MethodArgumentNotValidException` | 400 | Jakarta Bean Validation failed |
-
-
-## CloudFormation
-
-Infrastructure is split so that networking/compute is **shared once per environment**,
-while each microservice (`catalog`, `cart`) owns its **own** build pipeline, auto-deploy
-trigger, ECS service, target group, and SSM parameter. See
-[cloudFormation/generic/aws-architecture.txt](doc/aws-architecture.txt)
-for the full diagram.
-
-```
-SHARED (deployed once per environment)
-  VPC stack        → VPC, subnets, IGW, NAT, security groups
-  ECS-infra stack  → ECS Cluster + Application Load Balancer + Listener
-
-PER SERVICE (deployed once per microservice: catalog, cart)
-  IAM stack        → ECS task execution role + task role
-  CodeBuild stack  → ECR repo + CodeBuild project (GitHub → Docker → ECR)
-  Pipeline stack   → EventBridge + Lambda: auto-redeploys ECS on build success
-  ECS-service stack→ ECS Service + Target Group + ALB path rule (/<service>/*)
-  SSM Parameter    → /<env>-webstore-<service>-imageTag
+```powershell
+$Environment         = "dev"                      # dev | staging | prod
+$ProductName         = "<product>"
+$AppServiceName      = "<service>"
+$StackPrefix         = "$Environment-$ProductName"
+$AwsAccountId        = "<12-digit AWS account id>"
+$GitHubConnectionArn = "<arn:aws:codeconnections:...>"
+$GitHubOwner         = "<github org or user>"
+$GitHubRepo          = "<repository name>"
+$GitHubBranch        = "main"
 ```
 
+---
+
+## Deploy
+
+Run from the `cloud-formation/` folder. Every `aws cloudformation deploy` call uses
+`--capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND` and `--region <region>`.
+
+### Order
+
+| # | Tier | Step | Stack name |
+|---|---|---|---|
+| 1 | Product | `aws-vpc-stack.yml` | `$StackPrefix-vpc` |
+| 2 | Product | `aws-ecs-infra-stack.yml` | `$StackPrefix-ecs-infra` |
+| 3 | Service | `per-service/aws-codebuild-stack.yml` | `$StackPrefix-$AppServiceName-codebuild` |
+| 4 | Service | `per-service/aws-iam-stack.yml` | `$StackPrefix-$AppServiceName-iam` |
+| 5 | Service | `per-service/aws-rds-aurora-stack.yml` *(optional but required by the current service stack, which imports the DB outputs)* | `$StackPrefix-$AppServiceName-rds` |
+| 6 | Service | `aws ssm put-parameter` for the image tag | — |
+| 7 | Service | `per-service/aws-ecs-service-stack.yml` | `$StackPrefix-$AppServiceName-ecs-service` |
+| 8 | Service | `per-service/aws-pipeline-stack.yml` | `$StackPrefix-$AppServiceName-pipeline` |
+
+Example for one stack (all others follow the same shape; see
+[`RUN-STACK-INSTRUCTIONS.md`](cloud-formation/RUN-STACK-INSTRUCTIONS.md) for every command with its parameters):
+
+```powershell
+aws cloudformation deploy `
+  --stack-name "$StackPrefix-vpc" `
+  --template-file ./aws-vpc-stack.yml `
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND `
+  --parameter-overrides Environment=$Environment ProductName=$ProductName
 ```
-CodeBuild (per service) → ECR (per service)
-        │ on SUCCEEDED
-        ▼
-EventBridge → Lambda (per service) → ECS Service (per service, shared cluster)
-                                            │
-                                            ▼
-                              Target Group (per service) ← ALB (shared) ← internet
-                              
+
+### First deploy of a service
+
+1. Deploy steps 1–5, then create the image-tag parameter before the service stack:
+   ```powershell
+   aws ssm put-parameter --name "/$StackPrefix-$AppServiceName-imageTag" `
+     --value 1.0.0 --type String
+   ```
+2. Build and push the first image:
+   ```powershell
+   aws codebuild start-build --project-name "$StackPrefix-$AppServiceName-codebuild" `
+     --environment-variables-override name=IMAGE_TAG,value=1.0.0,type=PLAINTEXT
+   ```
+3. Deploy the service stack (unique `ListenerRulePriority` per service), then the pipeline stack.
+4. Start the tasks (`DesiredCount` is `0` by default):
+   ```powershell
+   aws ecs update-service --cluster "$StackPrefix-cluster" `
+     --service "$StackPrefix-$AppServiceName-service" `
+     --desired-count 1 --force-new-deployment
+   ```
+
+After that, every successful CodeBuild build redeploys the service automatically.
+
+### Adding another microservice
+
+Deploy steps 3–8 again with a new `AppServiceName` and a new `ListenerRulePriority`.
+The VPC, cluster and ALB are reused.
+
+### Teardown (reverse order)
+
+`ecs-service` → `pipeline` → `rds` (final snapshot is taken) → `iam` → `codebuild` → `ecs-infra` → `vpc`.
+Delete all service-tier stacks of every service before the product-tier stacks, because
+the product tier's exports are in use.
+
+---
+
+## Parameters you will most often set
+
+| Parameter | Stack | Default | Notes |
+|---|---|---|---|
+| `Environment` | all | `dev` | `dev`, `staging` or `prod` |
+| `ProductName` | all | — | Required |
+| `AppServiceName` | service tier | — | Required |
+| `AwsAccountId` | ecs-infra, codebuild, pipeline | — | Required |
+| `GitHubOwner`, `GitHubRepo`, `GitHubConnectionArn` | codebuild | — | Required; `GitHubBranch` defaults to `main` |
+| `ContainerPort` | vpc, ecs-service | `8080` | Keep both in sync |
+| `HealthCheckPath` | ecs-service | `/actuator/health` | Pass only the suffix; the template prepends `/<AppServiceName>` |
+| `ListenerRulePriority` | ecs-service | — | Unique per service on the shared ALB |
+| `TaskCpu` / `TaskMemory` | ecs-service | `512` / `1024` | Must be a valid Fargate combination |
+| `DesiredCount` | ecs-service | `0` | Scale after deploy |
+| `DbName`, `ServerlessMinCapacity`, `ServerlessMaxCapacity` | rds | `appdb`, `0.5`, `2` | Aurora capacity units |
+| `DeletionProtection`, `BackupRetentionDays` | rds | `false`, `7` | Enable protection in `prod` |
+
+Each template's `Parameters` section is the source of truth for the full list.
+
+---
+
+## Operations
+
+```powershell
+# Current image tag
+aws ssm get-parameter --name "/$StackPrefix-$AppServiceName-imageTag" --query "Parameter.Value" --output text
+
+# ALB DNS name
+aws cloudformation describe-stacks --stack-name "$StackPrefix-ecs-infra" `
+  --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" --output text
+
+# Follow the auto-deploy Lambda
+aws logs tail "/aws/lambda/$StackPrefix-$AppServiceName-deploy-trigger" --follow
+
+# Roll back to a previous task definition revision
+aws ecs update-service --cluster "$StackPrefix-cluster" `
+  --service "$StackPrefix-$AppServiceName-service" `
+  --task-definition "$StackPrefix-$AppServiceName-task:<revision>" --force-new-deployment
 ```
 
-**Deploy order:** VPC → ECS-infra → *for each service:* IAM → CodeBuild → ECS-service → Pipeline.
+More operational commands (build status, ECR images, task definitions, scaling through
+CloudFormation) are in [`RUN-STACK-INSTRUCTIONS.md`](cloud-formation/RUN-STACK-INSTRUCTIONS.md).
 
-Current active stacks live under `cloudFormation/ecs-simple/` (single-service). The
-multi-service-ready templates referenced above live under `cloudFormation/generic/per-service/`.
+---
 
+## Known limitations
 
-![aws-architecture.drawio.png](doc/aws-architecture.drawio.png)
-
-
-
-## Quick start
-
-```bash
-# Build (skip tests)
-mvn -B package -DskipTests
-
-# Run tests
-mvn test
-
-# Run the application (dev profile — H2 in-memory, no Flyway)
-mvn spring-boot:run
-```
+- The ALB listens on **HTTP :80 only**. Add an ACM certificate and an HTTPS listener before exposing production traffic.
+- A **single NAT Gateway** serves both private subnets — cheap, but not zone-fault tolerant.
+- **Fargate only.** There is no EC2 capacity (ASG / capacity provider) variant in this repository.
+- The service stack currently **requires the RDS stack** (it imports its outputs). A service without a database needs those imports and environment variables removed.
