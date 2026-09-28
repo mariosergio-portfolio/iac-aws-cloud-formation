@@ -1,0 +1,366 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Generic - AWS CodeBuild project: build a Docker image and push to ECR"
+
+# =============================================================================
+# generic/aws-codebuild-stack.yml
+#
+# Creates:
+#   - ECR Repository
+#   - CloudWatch Log Group
+#   - IAM Role for CodeBuild (ECR push + CloudWatch Logs + S3 read)
+#   - CodeBuild Project (privileged mode, GitHub source, buildspec.yml)
+#
+# All application-specific values are driven by parameters - no hardcoded
+# project names, account IDs, regions, or repository names.
+#
+# AppServiceName is the name of the application component (e.g., catalog, orders, payments)
+# which represents a single containerized microservice. It must match the value used in
+# app-ecs-stack.yml so both stacks refer to the same SSM parameter:
+#   /${Environment}-${ProductName}-${AppServiceName}-imageTag
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file cloudFormation/generic/aws-codebuild-stack.yml \
+#     --stack-name <env>-<app-name>-<component>-codebuild \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides \
+#         ProductName=my-product \
+#         AwsAccountId=123456789012 \
+#         Environment=prod \
+#         AppServiceName=catalog \
+#         GitHubOwner=my-org \
+#         GitHubRepo=my-repo \
+#         GitHubBranch=main \
+#         GitHubConnectionArn=arn:aws:codeconnections:us-east-1:ACCOUNT_ID:connection/CONNECTION_ID \
+#     --region us-east-1
+#
+# Trigger a build manually:
+#   aws codebuild start-build --project-name <env>-<app-name>-<component>-codebuild --region us-east-1
+#
+# Trigger with a custom image tag:
+#   aws codebuild start-build \
+#     --project-name <env>-<app-name>-<component>-codebuild \
+#     --environment-variables-override name=IMAGE_TAG,value=1.2.0,type=PLAINTEXT \
+#     --region us-east-1
+# =============================================================================
+
+Parameters:
+
+  ProductName:
+    Type: String
+    Description: "Application name - used to name all resources (e.g. my-product). Lowercase, hyphens allowed."
+
+  AwsAccountId:
+    Type: String
+    Description: "AWS Account ID where resources will be created (12-digit number)."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment."
+
+  AppServiceName:
+    Type: String
+    Description: >
+      AppServiceName is the name of the application component (e.g., catalog, orders, payments)
+      which represents a single containerized microservice.
+  GitHubOwner:
+    Type: String
+    Description: "GitHub account / organisation that owns the repository."
+
+  GitHubRepo:
+    Type: String
+    Description: "GitHub repository name (without the owner prefix)."
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: "Branch to build."
+
+  GitHubConnectionArn:
+    Type: String
+    Description: "AWS CodeConnections ARN for GitHub OAuth. Must be AVAILABLE before deploying."
+
+  BuildSpecFile:
+    Type: String
+    Default: buildspec.yml
+    Description: "Path to the buildspec file inside the repository (relative to repo root)."
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: "Default Docker image tag applied to every build. Can be overridden at start-build time."
+
+  ComputeType:
+    Type: String
+    Default: BUILD_GENERAL1_SMALL
+    AllowedValues:
+      - BUILD_GENERAL1_SMALL
+      - BUILD_GENERAL1_MEDIUM
+      - BUILD_GENERAL1_LARGE
+    Description: "CodeBuild compute size (SMALL=3 GB/2 vCPU, MEDIUM=7 GB/4 vCPU, LARGE=15 GB/8 vCPU)."
+
+  BuildTimeoutMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 480
+    Description: "Build timeout in minutes."
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: "CloudWatch Log Group retention period in days."
+
+Resources:
+
+  # -- ECR Repository ---------------------------------------------------------
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Environment}-${ProductName}-${AppServiceName}-repo"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AppServiceName
+          Value: !Ref AppServiceName
+        - Key: Layer
+          Value: microservice
+        - Key: ManagedBy
+          Value: cloudformation
+
+
+  # -- CloudWatch Log Group ---------------------------------------------------
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${Environment}-${ProductName}-${AppServiceName}-codebuild"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -- IAM Role for CodeBuild -------------------------------------------------
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-${ProductName}-${AppServiceName}-codebuild-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+
+        - PolicyName: EcrPushPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrAuthToken
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrImageOperations
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                Resource:
+                  - !Sub "arn:aws:ecr:${AWS::Region}:${AwsAccountId}:repository/${Environment}-${ProductName}-${AppServiceName}-repo"
+
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt CodeBuildLogGroup.Arn
+                  - !Sub "${CodeBuildLogGroup.Arn}:*"
+
+        - PolicyName: S3ArtifactPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: "*"
+
+        - PolicyName: CodeConnectionsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                  - codeconnections:GetConnectionToken
+                  - codeconnections:GetConnection
+                  - codestar-connections:UseConnection
+                  - codestar-connections:GetConnectionToken
+                  - codestar-connections:GetConnection
+                Resource:
+                  - !Ref GitHubConnectionArn
+
+        - PolicyName: CodeBuildReportsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource:
+                  - !Sub "arn:aws:codebuild:${AWS::Region}:${AwsAccountId}:report-group/${Environment}-${ProductName}-${AppServiceName}-codebuild-*"
+
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -- CodeBuild Project ------------------------------------------------------
+  AppBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: CodeBuildServiceRole
+    Properties:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-codebuild"
+      Description: !Sub "Builds the ${Environment}-${ProductName}-${AppServiceName} Docker image and pushes it to ECR"
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      TimeoutInMinutes: !Ref BuildTimeoutMinutes
+
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubOwner}/${GitHubRepo}.git"
+        BuildSpec: !Ref BuildSpecFile
+        GitCloneDepth: 1
+        ReportBuildStatus: true
+        Auth:
+          Type: CODECONNECTIONS
+          Resource: !Ref GitHubConnectionArn
+
+      SourceVersion: !Ref GitHubBranch
+
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: "aws/codebuild/standard:7.0"
+        ComputeType: !Ref ComputeType
+        HostKernel: LINUX_KERNEL_6
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+            Type: PLAINTEXT
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AwsAccountId
+            Type: PLAINTEXT
+          - Name: ECR_REPO
+            Value: !Sub "${Environment}-${ProductName}-${AppServiceName}-repo"
+            Type: PLAINTEXT
+          - Name: IMAGE_TAG
+            Value: !Ref ImageTag
+            Type: PLAINTEXT
+
+      Artifacts:
+        Type: NO_ARTIFACTS
+
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+          StreamName: "build"
+
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+          - LOCAL_SOURCE_CACHE
+
+      Visibility: PRIVATE
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: AppServiceName
+          Value: !Ref AppServiceName
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: Layer
+          Value: infrastructure
+        - Key: Purpose
+          Value: build
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+
+  EcrRepositoryUri:
+    Description: "ECR repository URI"
+    Value: !GetAtt EcrRepository.RepositoryUri
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-ecr-repository-uri"
+
+  CodeBuildProjectName:
+    Description: "CodeBuild project name"
+    Value: !Ref AppBuildProject
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-codebuild-project-name"
+
+  CodeBuildProjectArn:
+    Description: "CodeBuild project ARN"
+    Value: !GetAtt AppBuildProject.Arn
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-codebuild-project-arn"
+
+  CodeBuildServiceRoleArn:
+    Description: "IAM Role ARN used by CodeBuild"
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-codebuild-service-role-arn"
+
+  CodeBuildLogGroupName:
+    Description: "CloudWatch Log Group for build output"
+    Value: !Ref CodeBuildLogGroup
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-codebuild-log-group-name"
+
+  ManualTriggerCommand:
+    Description: "AWS CLI command to trigger a build manually"
+    Value: !Sub "aws codebuild start-build --project-name ${Environment}-${ProductName}-${AppServiceName}-codebuild --region ${AWS::Region}"

@@ -1,0 +1,307 @@
+------------- CONFIGURATION - CLOUD FORMATION --------------
+
+
+# External Github CodeBase connection repository (IF REPOSITORY IS PRIVATE)
+
+## two options:
+
+### Option A - OAuth (console, one-time)
+
+1. AWS Console → CodeBuild → Source credentials → Connect to GitHub → OAuth
+2. That's it - all CodeBuild projects in the account/region reuse it automatically.
+3. No changes to the template needed.
+
+STEPS EXECUTED:
+Connection CODEBUILDER directed created at AWS CodeBuild console, eg.: "myapplication-codebuild-connection" ("GitHubConnectionArn").
+NOTE: GitHubConnectionArn has NO default in the template - it MUST be passed via --parameter-overrides at deploy time.
+
+### Option B - Personal Access Token (PAT) via SSM
+Store the PAT first:
+  aws ssm put-parameter `
+    --name /myapplication/codebuild/github-token `
+    --value "ghp_xxxxxxxxxxxx" `
+    --type SecureString `
+    --region us-east-1
+
+------------------------------------------------------
+
+# RUNNING CLOUDFORMATION STACKS:
+
+## Requirements:
+- Install and run aws too: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+- Run the oauth login thought ´aws login´ command line.
+
+note: never hardcode values directly in a command, they are sensitive value
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED VARIABLES - set these once per shell session; every stack name and
+# --parameter-overrides value below is built from them
+
+- Set the variables with the values of your account/application on your console (cmd | windows power shell):
+$Environment         = "dev"
+$ProductName         = "<fill your product name>"
+$StackPrefix         = "$Environment-$ProductName" # -> "dev-yourproduct"
+$AppServiceName      = "<fill your app service name>"
+$AwsAccountId        = "<fill in - 12-digit AWS account ID>"
+$GitHubConnectionArn = "<fill in - arn:aws:codeconnections:...>"
+$GitHubOwner         = "<fill in - GitHub org or user>"
+$GitHubRepo          = "<fill in - GitHub repository name>"
+$GitHubBranch        = "main"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+## STACKS:
+
+# [1/9] VPC (VPC, Subnets, Security Groups, etc.) - only needed once per product
+aws cloudformation deploy `
+  --stack-name "$StackPrefix-vpc" `
+  --template-file ./aws-vpc-stack.yml `
+  --region us-east-1 `
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND `
+  --parameter-overrides `
+    Environment=$Environment `
+    ProductName=$ProductName
+
+
+# [2/9] ECS INFRA - PER PRODUCT (VPC, Subnets, Security Groups, ALB, Target Group, ECS Cluster, etc.)
+aws cloudformation deploy `
+  --template-file ./aws-ecs-infra-stack.yml `
+  --stack-name "$StackPrefix-ecs-infra" `
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND `
+  --region us-east-1 `
+  --parameter-overrides `
+    Environment=$Environment `
+    ProductName=$ProductName `
+    AwsAccountId=$AwsAccountId
+
+
+# [3/9] BUILD/DEPLOYMENT per APP COMPONENT (CodeBuild project, ECR repository, etc.) - only needed once per component
+
+# PowerShell: $p = Get-Content ./params-dev.json | ConvertFrom-Json
+aws cloudformation deploy `
+   --template-file ./per-service/aws-codebuild-stack.yml `
+   --stack-name "$StackPrefix-$AppServiceName-codebuild" `
+   --capabilities CAPABILITY_NAMED_IAM `
+   --region us-east-1 `
+   --parameter-overrides `
+       Environment=$Environment `
+       ProductName=$ProductName `
+       AwsAccountId=$AwsAccountId `
+       AppServiceName=$AppServiceName `
+       GitHubOwner=$GitHubOwner `
+       GitHubRepo=$GitHubRepo `
+       GitHubBranch=$GitHubBranch `
+       GitHubConnectionArn=$GitHubConnectionArn
+
+
+# [4/9] IAM per APP COMPONENT (ECS task role, execution role, etc.) - only needed once per component
+aws cloudformation deploy `
+  --stack-name "$StackPrefix-$AppServiceName-iam" `
+  --template-file ./per-service/aws-iam-stack.yml `
+  --region us-east-1 `
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND `
+  --parameter-overrides `
+    Environment=$Environment `
+    ProductName=$ProductName `
+    AppServiceName=$AppServiceName
+
+
+# [5/9] RDS AURORA per APP COMPONENT (Aurora PostgreSQL Serverless v2 cluster, DB secret,
+# subnet group, security group) - only needed once per component. Must be deployed before
+# the ECS SERVICES stack (step 7), which imports DB_HOST/DB_PORT/DB_NAME/DB_SECRET_ARN from it.
+aws cloudformation deploy `
+  --stack-name "$StackPrefix-$AppServiceName-rds" `
+  --template-file ./per-service/aws-rds-aurora-stack.yml `
+  --region us-east-1 `
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND `
+  --parameter-overrides `
+    Environment=$Environment `
+    ProductName=$ProductName `
+    AppServiceName=$AppServiceName `
+    DbName=$ProductName
+
+
+# [6/9] PUT SSM PARAMETER (IMAGE TAG) - per APP COMPONENT (ECS task definition reads the image tag from SSM Parameter Store)
+aws ssm put-parameter `
+  --name "$StackPrefix-$AppServiceName-imageTag" `
+  --value 1.0.0 `
+  --type String `
+  --region us-east-1 `
+  # --overwrite `
+  --tags Key=Environment,Value=$Environment `
+             Key=ProductName,Value=$ProductName `
+             Key=AppServiceName,Value=$AppServiceName `
+             Key=Layer,Value=infrastructure
+
+
+
+# [7/9] ECS SERVICES - per APP COMPONENT (ECS task definition, ECS service, ALB listener rule, etc.)
+
+# NOTE: The ImageTag parameter is NO MORE REQUIRED as input for deploy aws-ecs-stack.
+ The ECS task definition now reads the image tag from SSM Parameter Store.
+
+# NOTE ON HealthCheckPath: do NOT pass "/$AppServiceName/actuator/health" here.
+# The template already builds the target group's health-check path as
+# "/${AppServiceName}${HealthCheckPath}", so HealthCheckPath must stay just the
+# suffix (default "/actuator/health"). The application must run with
+# server.servlet.context-path=/$AppServiceName to match. Passing the combined
+# path here would double it up (e.g. /webstore/webstore/actuator/health).
+
+aws cloudformation deploy `
+  --template-file ./per-service/aws-ecs-service-stack.yml `
+  --stack-name "$StackPrefix-$AppServiceName-ecs-service" `
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND `
+  --region us-east-1 `
+  --parameter-overrides `
+    Environment=$Environment `
+    ProductName=$ProductName `
+    AppServiceName=$AppServiceName `
+    ListenerRulePriority=10 `
+    AwsAccountId=$AwsAccountId
+
+
+# [8/9] CI/CD PIPELINE TRIGGER - per APP COMPONENT (EventBridge -> Lambda -> ECS redeploy)
+# After this stack is deployed every successful CodeBuild build automatically
+# registers a new ECS task definition revision and force-redeploys the ECS service.
+# No manual redeployment step needed.
+#
+# All resource names (CodeBuild project, ECR URI, ECS cluster/service/task family,
+# container name, SSM parameter) are derived from ProductName + AppServiceName +
+# Environment - no extra parameters required.
+
+aws cloudformation deploy `
+  --template-file ./per-service/aws-pipeline-stack.yml `
+  --stack-name "$StackPrefix-$AppServiceName-pipeline" `
+  --capabilities CAPABILITY_NAMED_IAM `
+  --region us-east-1 `
+  --parameter-overrides `
+    Environment=$Environment `
+    ProductName=$ProductName `
+    AwsAccountId=$AwsAccountId `
+    AppServiceName=$AppServiceName
+
+
+# [9/9] VERIFY PIPELINE STACK DEPLOYED CORRECTLY
+# Inspect Lambda logs after a build to confirm the auto-deploy fired:
+aws logs tail "/aws/lambda/$StackPrefix-$AppServiceName-deploy-trigger" --follow --region us-east-1
+
+# Check the current deployed image tag in SSM:
+aws ssm get-parameter `
+  --name "$StackPrefix-$AppServiceName-imageTag" `
+  --region us-east-1 `
+  --query "Parameter.Value" `
+  --output text
+
+
+-------------------------------------
+
+
+
+------------- OPERATION - IMAGE BUILD  && REDEPLOYMENT --------------
+
+# [1/2] - Build & push new image to ECR (via CodeBuild)
+
+  aws codebuild start-build `
+    --project-name "$StackPrefix-$AppServiceName-codebuild" `
+    --region us-east-1 `
+    --environment-variables-override name=IMAGE_TAG,value=1.0.0,type=PLAINTEXT
+    # --source-version develop
+
+# [2/2] - set the desired count (number of instances), and force new deployment (fastest, no CloudFormation needed):
+note1: ON FIRST DEPLOY RUN THIS COMMAND AFTER A SUCCESSFUL BUILD (Step 1) TO FORCE ECS TO REDEPLOY THE SERVICE WITH THE NEW IMAGE:
+note2: Subsequents deploys DO NOT REQUIRES force new deploy, the pipeline will trigger it after an success build (codebuilder)
+aws ecs update-service `
+    --cluster "$StackPrefix-cluster" `
+    --service "$StackPrefix-$AppServiceName-service" `
+    --desired-count 3 `
+    --force-new-deployment `
+    --region us-east-1
+----------------------------------------------------------------------
+
+
+
+------------------------------------
+UTILS: (Formation)
+------------------------------------
+
+aws cloudformation delete-stack --stack-name "$StackPrefix-codebuild"
+aws cloudformation delete-stack --stack-name "$StackPrefix-ecs"
+
+aws cloudformation describe-stacks `
+    --stack-name "$StackPrefix-ecs" `
+    --region us-east-1 `
+    --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" `
+    --output text
+
+# continue-update-rollback or update-stack
+aws cloudformation continue-update-rollback `
+   --stack-name "$StackPrefix-ecs"
+
+
+# UPDATE stack parameters (e.g. DesiredCount) without changing the template or redeploying the whole stack.:
+ If your ECS resources (task definition, service, cluster) are defined
+ in aws-ecs-stack.yml, the CloudFormation approach is better
+ - and the manual register-task-definition approach becomes actively risky in that context.
+#
+aws cloudformation update-stack `
+    --stack-name "$StackPrefix-$AppServiceName-ecs-service"`
+    --use-previous-template `
+    --parameters `
+      ParameterKey=ProductName,UsePreviousValue=true `
+      ParameterKey=Environment,UsePreviousValue=true `
+      ParameterKey=AppComponentName,UsePreviousValue=true `
+      ParameterKey=ContainerPort,UsePreviousValue=true `
+      ParameterKey=HealthCheckPath,UsePreviousValue=true `
+      ParameterKey=HealthCheckIntervalSeconds,UsePreviousValue=true `
+      ParameterKey=HealthCheckTimeoutSeconds,UsePreviousValue=true `
+      ParameterKey=HealthyThresholdCount,UsePreviousValue=true `
+      ParameterKey=UnhealthyThresholdCount,UsePreviousValue=true `
+      ParameterKey=ListenerRulePriority,UsePreviousValue=true `
+      ParameterKey=TaskCpu,UsePreviousValue=true `
+      ParameterKey=TaskMemory,UsePreviousValue=true `
+      ParameterKey=LogRetentionDays,UsePreviousValue=true `
+      ParameterKey=DesiredCount,ParameterValue=3 `
+    --region us-east-1
+
+-------------------------------------------
+
+
+
+
+-------------------------------------------
+UTILS: (Operations)
+-------------------------------------------
+
+  # Get the build ID from the start-build output, then:
+  aws codebuild batch-get-builds `
+    --ids <build-id> `
+    --region us-east-1 `
+    --query "builds[0].{status:buildStatus,phase:currentPhase}"
+
+
+  # RESTORE ONE SPECIFIC TASK DEFINITION VERSION (if needed)
+  aws ecs update-service `
+    --cluster "$StackPrefix-cluster" `
+    --service "$StackPrefix-$AppServiceName-service" `
+    --force-new-deployment `
+    --region us-east-1 `
+    --task-definition "$StackPrefix-task:5"  #OPTIONAL: specify the task definition version to use (latest is default)
+
+  aws ecr describe-images `
+   --repository-name "$StackPrefix-repo" `
+   --region us-east-1 `
+   --query 'sort_by(imageDetails,& imagePushedAt)[*].[imageTags[0],imagePushedAt]' `
+   --output table
+
+  aws ecs list-task-definition-families --region us-east-1
+
+  aws ecs list-task-definitions `
+    --family-prefix "$StackPrefix-$AppServiceName-task" `
+    --region us-east-1 `
+    --sort DESC
+
+  aws ecs describe-task-definition `
+    --task-definition "$StackPrefix-$AppServiceName-task:5" `
+    --query 'taskDefinition.containerDefinitions[*].image'
+
+-------------------------------------------------------

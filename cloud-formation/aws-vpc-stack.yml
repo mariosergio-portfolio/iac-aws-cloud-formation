@@ -1,0 +1,377 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Generic - VPC, subnets, IGW, NAT Gateway, route tables, security groups"
+
+# =============================================================================
+# generic/aws-vpc-stack.yml
+#
+# Creates:
+#   - VPC
+#   - Internet Gateway
+#   - 2 Public subnets (ALB + NAT)
+#   - 2 Private subnets (Fargate tasks)
+#   - NAT Gateway (single AZ - cost-optimised for non-prod)
+#   - Public and Private route tables
+#   - ALB security group  (inbound HTTP :80 from internet)
+#   - ECS security group  (inbound from ALB only on ContainerPort)
+#
+# All outputs are exported so app-ecs-stack.yml can import them via
+# Fn::ImportValue with the same ${Environment}-${ProductName} prefix.
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file cloudFormation/generic/aws-vpc-stack.yml \
+#     --stack-name <env>-<app-name>-vpc \
+#     --parameter-overrides \
+#         ProductName=my-product \
+#         Environment=prod \
+#         VpcCidr=10.0.0.0/16 \
+#         PublicSubnetACidr=10.0.0.0/24 \
+#         PublicSubnetBCidr=10.0.1.0/24 \
+#         PrivateSubnetACidr=10.0.10.0/24 \
+#         PrivateSubnetBCidr=10.0.11.0/24 \
+#         ContainerPort=8080 \
+#     --region us-east-1
+# =============================================================================
+
+Parameters:
+
+  ProductName:
+    Type: String
+    Description: "Application name - used to name and tag all resources."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment."
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: "CIDR block for the VPC."
+
+  PublicSubnetACidr:
+    Type: String
+    Default: 10.0.0.0/24
+    Description: "CIDR block for Public Subnet A (first AZ)."
+
+  PublicSubnetBCidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: "CIDR block for Public Subnet B (second AZ)."
+
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.0.10.0/24
+    Description: "CIDR block for Private Subnet A (first AZ)."
+
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.0.11.0/24
+    Description: "CIDR block for Private Subnet B (second AZ)."
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    Description: "Port the container listens on - allowed inbound on the ECS security group from the ALB."
+
+Resources:
+
+  # ── VPC ─────────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-vpc"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: infrastructure
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Internet Gateway ─────────────────────────────────────────────────────────
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-igw"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ── Public Subnets (ALB + NAT) ───────────────────────────────────────────────
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-public-a"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-public-b"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Private Subnets (Fargate tasks) ─────────────────────────────────────────
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-private-a"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-private-b"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── NAT Gateway (single AZ - cost-optimised) ─────────────────────────────────
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachIGW
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-nat-eip"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-nat"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Route Tables ─────────────────────────────────────────────────────────────
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-public-rt"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-private-rt"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ── Security Groups ──────────────────────────────────────────────────────────
+  SgAlb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${Environment}-${ProductName}-sg-alb"
+      GroupDescription: "ALB inbound HTTP from internet"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-sg-alb"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  SgEcs:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${Environment}-${ProductName}-sg-ecs"
+      GroupDescription: "ECS Fargate tasks - inbound from ALB only"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref SgAlb
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-sg-ecs"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+
+  VpcId:
+    Description: "VPC ID"
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-vpc-id"
+
+  PublicSubnetA:
+    Description: "Public Subnet A ID"
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-public-subnet-a"
+
+  PublicSubnetB:
+    Description: "Public Subnet B ID"
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-public-subnet-b"
+
+  PrivateSubnetA:
+    Description: "Private Subnet A ID"
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-private-subnet-a"
+
+  PrivateSubnetB:
+    Description: "Private Subnet B ID"
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-private-subnet-b"
+
+  SgAlbId:
+    Description: "ALB Security Group ID"
+    Value: !Ref SgAlb
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-sg-alb-id"
+
+  SgEcsId:
+    Description: "ECS Security Group ID"
+    Value: !Ref SgEcs
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-sg-ecs-id"

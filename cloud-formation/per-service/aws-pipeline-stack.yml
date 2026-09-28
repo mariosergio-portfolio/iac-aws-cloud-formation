@@ -1,0 +1,509 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Generic - Auto-deploy pipeline trigger: EventBridge + Lambda re-deploys an ECS service on every successful CodeBuild build"
+
+# =============================================================================
+# generic/per-service/aws-pipeline-stack.yml
+#
+# Architecture (event-driven, zero cost at idle):
+#
+#   CodeBuild build SUCCEEDED
+#         │
+#         ▼
+#   EventBridge Rule  (source: aws.codebuild, detail-type: CodeBuild Build State Change)
+#         │
+#         ▼
+#   Lambda  <env>-<product>-<service>-deploy-trigger
+#         │  1. read IMAGE_TAG from the build's exportedEnvironmentVariables
+#         │  2. call codebuild:BatchGetBuilds  (full env vars + project metadata)
+#         │  3. register new TaskDefinition revision  (swap container image tag)
+#         │  4. call ecs:UpdateService  (force new deployment)
+#         │  5. write IMAGE_TAG to SSM  (source of truth, keeps ecs-service-stack in sync)
+#         ▼
+#   ECS Service rolls out new tasks (DeploymentCircuitBreaker handles rollback)
+#
+# Why NOT CodePipeline?
+#   CodePipeline adds $1/pipeline/month + S3 artifact overhead and requires an
+#   explicit pipeline stage per action.  For "build done → redeploy ECS" an
+#   EventBridge + Lambda is simpler, cheaper and equally reliable.
+#
+# Prerequisites (must exist before deploying this stack):
+#   - <env>-<product>-<service>-codebuild  stack  →  CodeBuild project + ECR repo
+#   - <env>-<product>-<service>-iam        stack  →  ECS task execution & task roles
+#   - <env>-<product>-<service>-service    stack  →  ECS cluster + ECS service
+#
+# The CodeBuild project name and ECR image URI are derived from the same
+# ProductName / AppServiceName / Environment convention used by all other stacks:
+#   CodeBuild project : ${Environment}-${ProductName}-${AppServiceName}-codebuild
+#   ECR image URI     : ${AwsAccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Environment}-${ProductName}-${AppServiceName}-repo
+#   ECS cluster       : ${Environment}-${ProductName}-cluster
+#   ECS service       : ${Environment}-${ProductName}-${AppServiceName}-service
+#   Task family       : ${Environment}-${ProductName}-${AppServiceName}-task
+#   Container name    : ${Environment}-${ProductName}-${AppServiceName}-container
+#   SSM param         : /${Environment}-${ProductName}-${AppServiceName}-imageTag
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file cloudFormation/generic/per-service/aws-pipeline-stack.yml \
+#     --stack-name <env>-<product>-<service>-pipeline \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides \
+#         ProductName=my-product \
+#         AwsAccountId=123456789012 \
+#         Environment=prod \
+#         AppServiceName=catalog \
+#     --region us-east-1
+#
+# Trigger a build + auto-deploy manually:
+#   aws codebuild start-build \
+#     --project-name <env>-<product>-<service>-codebuild \
+#     --environment-variables-override name=IMAGE_TAG,value=1.2.0,type=PLAINTEXT \
+#     --region us-east-1
+# =============================================================================
+
+Parameters:
+
+  ProductName:
+    Type: String
+    Description: "Application name - used to name all resources (e.g. my-product). Lowercase, hyphens allowed."
+
+  AwsAccountId:
+    Type: String
+    Description: "AWS Account ID where resources will be created (12-digit number)."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment."
+
+  AppServiceName:
+    Type: String
+    Description: >
+      Name of the application component (e.g., catalog, orders, payments).
+      Represents a single containerized microservice. Must match the value used
+      in aws-codebuild-stack, aws-iam-stack and aws-ecs-service-stack so all
+      stacks reference the same SSM parameter and resource names.
+
+  FallbackImageTag:
+    Type: String
+    Default: latest
+    Description: >
+      Tag used when IMAGE_TAG is not present in the build environment variables
+      (e.g. builds triggered without --environment-variables-override).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: "CloudWatch log retention in days for the deploy Lambda."
+
+Resources:
+
+  # ============================================================================
+  # CloudWatch Log Group for the Lambda function
+  # ============================================================================
+  DeployLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Environment}-${ProductName}-${AppServiceName}-deploy-trigger"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AppServiceName
+          Value: !Ref AppServiceName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ============================================================================
+  # IAM Role for the Lambda function
+  # ============================================================================
+  DeployLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-${ProductName}-${AppServiceName}-deploy-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+
+        # --- CloudWatch Logs: write Lambda output ---------------------------------
+        - PolicyName: LambdaLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt DeployLambdaLogGroup.Arn
+                  - !Sub "${DeployLambdaLogGroup.Arn}:*"
+
+        # --- CodeBuild: read build details to extract IMAGE_TAG ------------------
+        - PolicyName: CodeBuildReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                Resource:
+                  - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${Environment}-${ProductName}-${AppServiceName}-codebuild"
+
+        # --- ECS: describe task definitions, register new revision, update service
+        - PolicyName: EcsDeployPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                  - ecs:DescribeServices
+                  - ecs:TagResource
+                Resource: "*"
+
+        # --- SSM: persist the deployed ImageTag as source of truth ---------------
+        #     Avoids calling cfn:UpdateStack which would cause CloudFormation to
+        #     re-evaluate TaskDefinition and trigger UPDATE_FAILED conflicts.
+        - PolicyName: SsmPutPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Environment}-${ProductName}-${AppServiceName}-imageTag"
+
+        # --- IAM: pass the task execution role and task role to ECS --------------
+        - PolicyName: IamPassRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: "*"
+                Condition:
+                  StringLike:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AppServiceName
+          Value: !Ref AppServiceName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ============================================================================
+  # Lambda function — <env>-<product>-<service>-deploy-trigger
+  # ============================================================================
+  DeployLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DeployLambdaLogGroup
+    Properties:
+      FunctionName: !Sub "${Environment}-${ProductName}-${AppServiceName}-deploy-trigger"
+      Description: >
+        Triggered by EventBridge when the CodeBuild project for this service
+        succeeds. Reads IMAGE_TAG from the build env vars, registers a new ECS
+        task definition revision pointing at the new image, and force-deploys
+        the ECS service.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DeployLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          ECS_CLUSTER:       !Sub "${Environment}-${ProductName}-cluster"
+          ECS_SERVICE:       !Sub "${Environment}-${ProductName}-${AppServiceName}-service"
+          TASK_FAMILY:       !Sub "${Environment}-${ProductName}-${AppServiceName}-task"
+          ECR_IMAGE_URI:     !Sub "${AwsAccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Environment}-${ProductName}-${AppServiceName}-repo"
+          CONTAINER_NAME:    !Sub "${Environment}-${ProductName}-${AppServiceName}-container"
+          SSM_PARAM_NAME:    !Sub "${Environment}-${ProductName}-${AppServiceName}-imageTag"
+          FALLBACK_TAG:      !Ref FallbackImageTag
+          CODEBUILD_PROJECT: !Sub "${Environment}-${ProductName}-${AppServiceName}-codebuild"
+
+      # ── Inline Lambda code ──────────────────────────────────────────────────
+      Code:
+        ZipFile: |
+          import os, json, boto3, logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ecs = boto3.client("ecs")
+          cb  = boto3.client("codebuild")
+          ssm = boto3.client("ssm")
+
+          ECS_CLUSTER    = os.environ["ECS_CLUSTER"]
+          ECS_SERVICE    = os.environ["ECS_SERVICE"]
+          TASK_FAMILY    = os.environ["TASK_FAMILY"]
+          ECR_IMAGE_URI  = os.environ["ECR_IMAGE_URI"]
+          CONTAINER_NAME = os.environ["CONTAINER_NAME"]
+          SSM_PARAM_NAME = os.environ["SSM_PARAM_NAME"]
+          FALLBACK_TAG   = os.environ["FALLBACK_TAG"]
+          CB_PROJECT     = os.environ["CODEBUILD_PROJECT"]
+
+          def get_image_tag(event: dict) -> str:
+              """
+              Extract IMAGE_TAG from the CodeBuild build event.
+              EventBridge sends the build ID in event["detail"]["build-id"].
+              We call BatchGetBuilds to get the full environment variable list.
+              """
+              build_id = event.get("detail", {}).get("build-id", "")
+              if not build_id:
+                  logger.warning("No build-id in event; using fallback tag '%s'", FALLBACK_TAG)
+                  return FALLBACK_TAG
+
+              resp   = cb.batch_get_builds(ids=[build_id])
+              builds = resp.get("builds", [])
+              if not builds:
+                  logger.warning("BatchGetBuilds returned no results; using fallback tag '%s'", FALLBACK_TAG)
+                  return FALLBACK_TAG
+
+              env_vars = builds[0].get("environment", {}).get("environmentVariables", [])
+              for var in env_vars:
+                  if var.get("name") == "IMAGE_TAG":
+                      tag = var.get("value", "").strip()
+                      if tag:
+                          logger.info("Found IMAGE_TAG='%s' in build environment", tag)
+                          return tag
+
+              logger.warning("IMAGE_TAG not found in build env vars; using fallback tag '%s'", FALLBACK_TAG)
+              return FALLBACK_TAG
+
+          def get_current_task_definition() -> dict:
+              """Fetch the latest active task definition for the family."""
+              resp = ecs.describe_task_definition(
+                  taskDefinition=TASK_FAMILY,
+                  include=["TAGS"]
+              )
+              return resp["taskDefinition"]
+
+          def register_new_revision(current_td: dict, image_tag: str) -> str:
+              """
+              Clone the current task definition, swap the container image tag,
+              and register a new revision. Returns the new task definition ARN.
+              """
+              # Fields that cannot be passed back to RegisterTaskDefinition
+              skip_keys = {
+                  "taskDefinitionArn", "revision", "status",
+                  "requiresAttributes", "compatibilities",
+                  "registeredAt", "registeredBy", "deregisteredAt",
+              }
+
+              new_td    = {k: v for k, v in current_td.items() if k not in skip_keys}
+              new_image = f"{ECR_IMAGE_URI}:{image_tag}"
+              updated   = False
+
+              for container in new_td.get("containerDefinitions", []):
+                  if container["name"] == CONTAINER_NAME:
+                      old_image = container.get("image", "")
+                      container["image"] = new_image
+                      logger.info(
+                          "Container '%s': image updated  %s  →  %s",
+                          CONTAINER_NAME, old_image, new_image,
+                      )
+                      updated = True
+                      break
+
+              if not updated:
+                  raise ValueError(
+                      f"Container '{CONTAINER_NAME}' not found in task definition "
+                      f"'{TASK_FAMILY}'. Check the ContainerName parameter."
+                  )
+
+              # Preserve tags from the current task definition (omit if empty —
+              # RegisterTaskDefinition rejects tags=[] with ClientException)
+              tags   = current_td.get("tags", [])
+              kwargs = dict(**new_td)
+              if tags:
+                  kwargs["tags"] = tags
+
+              resp    = ecs.register_task_definition(**kwargs)
+              new_arn = resp["taskDefinition"]["taskDefinitionArn"]
+              logger.info("Registered new task definition revision: %s", new_arn)
+              return new_arn
+
+          def deploy_service(task_def_arn: str) -> None:
+              """Force a new ECS service deployment with the given task definition."""
+              resp = ecs.update_service(
+                  cluster=ECS_CLUSTER,
+                  service=ECS_SERVICE,
+                  taskDefinition=task_def_arn,
+                  forceNewDeployment=True,
+              )
+              svc = resp["service"]
+              logger.info(
+                  "ECS service '%s' on cluster '%s' updated. "
+                  "RunningCount=%d, DesiredCount=%d, PendingCount=%d",
+                  svc["serviceName"],
+                  ECS_CLUSTER,
+                  svc.get("runningCount", 0),
+                  svc.get("desiredCount", 0),
+                  svc.get("pendingCount", 0),
+              )
+
+          def sync_image_tag_to_ssm(image_tag: str) -> None:
+              """
+              Write the deployed ImageTag to SSM Parameter Store.
+              This is the single source of truth — avoids calling cfn:UpdateStack
+              which would cause CloudFormation to re-evaluate TaskDefinition and fail.
+              Read the current value with:
+                aws ssm get-parameter --name /<env>-<product>-<service>-imageTag
+              """
+              ssm.put_parameter(
+                  Name=SSM_PARAM_NAME,
+                  Value=image_tag,
+                  Type="String",
+                  Overwrite=True,
+                  Description=f"Last image tag deployed to ECS service {ECS_SERVICE}",
+              )
+              logger.info("SSM parameter '%s' updated → '%s'", SSM_PARAM_NAME, image_tag)
+
+          def handler(event, context):
+              logger.info("Event received: %s", json.dumps(event))
+
+              # Safety guard: only act on our project's successful builds
+              project_name = event.get("detail", {}).get("project-name", "")
+              build_status = event.get("detail", {}).get("build-status", "")
+
+              if project_name != CB_PROJECT:
+                  logger.info(
+                      "Ignoring event from project '%s' (expected '%s')",
+                      project_name, CB_PROJECT,
+                  )
+                  return {"statusCode": 200, "body": "ignored — wrong project"}
+
+              if build_status != "SUCCEEDED":
+                  logger.info("Build status is '%s', not SUCCEEDED — skipping", build_status)
+                  return {"statusCode": 200, "body": f"ignored — status {build_status}"}
+
+              image_tag  = get_image_tag(event)
+              current_td = get_current_task_definition()
+              new_td_arn = register_new_revision(current_td, image_tag)
+              deploy_service(new_td_arn)
+              sync_image_tag_to_ssm(image_tag)
+
+              result = {
+                  "imageTag":          image_tag,
+                  "taskDefinitionArn": new_td_arn,
+                  "ecsCluster":        ECS_CLUSTER,
+                  "ecsService":        ECS_SERVICE,
+                  "ssmParamSynced":    SSM_PARAM_NAME,
+              }
+              logger.info("Deploy triggered successfully: %s", json.dumps(result))
+              return {"statusCode": 200, "body": json.dumps(result)}
+
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AppServiceName
+          Value: !Ref AppServiceName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ============================================================================
+  # Permission: allow EventBridge to invoke the Lambda
+  # ============================================================================
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DeployLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CodeBuildSucceededRule.Arn
+
+  # ============================================================================
+  # EventBridge Rule — fires when the CodeBuild project reaches SUCCEEDED
+  # ============================================================================
+  CodeBuildSucceededRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-codebuild-succeeded"
+      Description: !Sub >
+        Fires when the ${Environment}-${ProductName}-${AppServiceName}-codebuild
+        project transitions to SUCCEEDED. Triggers the deploy Lambda to update
+        the ECS service with the new image tag.
+      State: ENABLED
+
+      # Event pattern: CodeBuild build state change → SUCCEEDED, this project only
+      EventPattern:
+        source:
+          - "aws.codebuild"
+        detail-type:
+          - "CodeBuild Build State Change"
+        detail:
+          build-status:
+            - "SUCCEEDED"
+          project-name:
+            - !Sub "${Environment}-${ProductName}-${AppServiceName}-codebuild"
+
+      Targets:
+        - Id: !Sub "${Environment}-${ProductName}-${AppServiceName}-deploy-lambda"
+          Arn: !GetAtt DeployLambdaFunction.Arn
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+
+  LambdaFunctionName:
+    Description: "Deploy trigger Lambda function name"
+    Value: !Ref DeployLambdaFunction
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-pipeline-lambda-name"
+
+  LambdaFunctionArn:
+    Description: "Deploy trigger Lambda function ARN"
+    Value: !GetAtt DeployLambdaFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-pipeline-lambda-arn"
+
+  EventBridgeRuleName:
+    Description: "EventBridge rule that fires on CodeBuild SUCCEEDED"
+    Value: !Ref CodeBuildSucceededRule
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-pipeline-rule-name"
+
+  EventBridgeRuleArn:
+    Description: "EventBridge rule ARN"
+    Value: !GetAtt CodeBuildSucceededRule.Arn
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-pipeline-rule-arn"
+
+  DeployLambdaLogGroupName:
+    Description: "CloudWatch Log Group for the deploy Lambda"
+    Value: !Ref DeployLambdaLogGroup
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-pipeline-log-group"
+
+  SsmImageTagParam:
+    Description: "SSM parameter name where the deployed image tag is persisted"
+    Value: !Sub "${Environment}-${ProductName}-${AppServiceName}-imageTag"
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-pipeline-ssm-param"
+
+  TriggerExample:
+    Description: "CLI command to trigger a build + auto-deploy"
+    Value: !Sub >-
+      aws codebuild start-build
+      --project-name ${Environment}-${ProductName}-${AppServiceName}-codebuild
+      --environment-variables-override name=IMAGE_TAG,value=1.0.0,type=PLAINTEXT
+      --region ${AWS::Region}

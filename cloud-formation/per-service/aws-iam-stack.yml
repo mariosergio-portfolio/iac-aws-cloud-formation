@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Generic - IAM roles for ECS Fargate (task execution role + task role)"
+
+# =============================================================================
+# generic/aws-iam-stack.yml
+#
+# Creates:
+#   - ECS Task Execution Role  (pulls images from ECR, ships logs to CloudWatch)
+#   - ECS Task Role            (permissions for the running container process)
+#
+# Outputs are exported so app-ecs-stack.yml can import them via
+# Fn::ImportValue with the same ${Environment}-${ProductName}-${AppServiceName} prefix.
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file cloudFormation/generic/aws-iam-stack.yml \
+#     --stack-name <env>-<app-name>-<component>-iam \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides \
+#         ProductName=my-product \
+#         Environment=prod \
+#         AppServiceName=catalog \
+#     --region us-east-1
+# =============================================================================
+
+Parameters:
+
+  ProductName:
+    Type: String
+    Description: "Application name - used to name and tag all resources."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment."
+
+  AppServiceName:
+    Type: String
+    Description: >
+      AppServiceName is the name of the application component (e.g., catalog, orders, payments)
+      which represents a single containerized microservice.
+
+Resources:
+
+  # ── ECS Task Execution Role ──────────────────────────────────────────────────
+  # Used by the ECS agent to pull images from ECR, ship logs to CloudWatch, and
+  # resolve the container definition's "Secrets" (valueFrom) entries at task
+  # startup - e.g. DB_USERNAME/DB_PASSWORD pulled from the Aurora DB secret in
+  # aws-ecs-service-stack.yml. This is a DIFFERENT role from the task role
+  # below, which the running application process itself assumes.
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-${ProductName}-${AppServiceName}-ecs-task-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: !Sub "${Environment}-${ProductName}-${AppServiceName}-ecs-execution-secrets-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:*:*:secret:${Environment}-${ProductName}-${AppServiceName}-db-secret*"
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AppServiceName
+          Value: !Ref AppServiceName
+        - Key: Layer
+          Value: iam
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── ECS Task Role ────────────────────────────────────────────────────────────
+  # Used by the running container process itself.
+  # Grants CloudWatch Logs write access scoped to this component's log group prefix.
+  # Extend the inline policy with additional statements as the app requires
+  # (e.g. S3, SSM Parameter Store, SQS, DynamoDB).
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-${ProductName}-${AppServiceName}-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${Environment}-${ProductName}-${AppServiceName}-ecs-task-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:*:*:log-group:/ecs/${Environment}-${ProductName}-${AppServiceName}*"
+      Tags:
+        - Key: AppServiceName
+          Value: !Ref AppServiceName
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+
+  EcsTaskExecutionRoleArn:
+    Description: "ECS Task Execution Role ARN"
+    Value: !GetAtt EcsTaskExecutionRole.Arn
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-ecs-task-execution-role-arn"
+
+  EcsTaskRoleArn:
+    Description: "ECS Task Role ARN"
+    Value: !GetAtt EcsTaskRole.Arn
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-ecs-task-role-arn"

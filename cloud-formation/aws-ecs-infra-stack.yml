@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Generic - Shared ECS cluster and ALB for a product (deployed once per product)"
+
+# =============================================================================
+# generic/aws-ecs-infra-stack.yml
+#
+# Creates shared infrastructure for ONE product, deployed once per environment.
+# Multiple AppComponentName microservices attach to the cluster and ALB via
+# app-service-stack.yml (one stack deployment per component).
+#
+# Creates:
+#   - ECS Cluster
+#   - Application Load Balancer (internet-facing, HTTP :80)
+#   - ALB Listener (default action: 404 fixed response - each service stack
+#     adds its own ListenerRule with a path-based condition)
+#
+# Depends on exports from:
+#   - aws-vpc-stack.yml  (VPC, subnets, security groups)
+#
+# Exports (consumed by app-service-stack.yml per component):
+#   - ${Environment}-${ProductName}-ecs-cluster-name
+#   - ${Environment}-${ProductName}-ecs-cluster-arn
+#   - ${Environment}-${ProductName}-alb-arn
+#   - ${Environment}-${ProductName}-alb-listener-arn
+#   - ${Environment}-${ProductName}-alb-dns
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file cloudFormation/generic/app-shared-stack.yml \
+#     --stack-name <env>-<product>-shared \
+#     --parameter-overrides \
+#         ProductName=my-product \
+#         Environment=prod \
+#     --region us-east-1
+# =============================================================================
+
+Parameters:
+
+  ProductName:
+    Type: String
+    Description: "Application name - must match the prefix used in app-vpc-stack exports."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment."
+
+Resources:
+
+  # ── ECS Cluster ──────────────────────────────────────────────────────────────
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${Environment}-${ProductName}-cluster"
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: infrastructure
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Application Load Balancer ─────────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${Environment}-${ProductName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - Fn::ImportValue: !Sub "${Environment}-${ProductName}-public-subnet-a"
+        - Fn::ImportValue: !Sub "${Environment}-${ProductName}-public-subnet-b"
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "${Environment}-${ProductName}-sg-alb-id"
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── ALB Listener ─────────────────────────────────────────────────────────────
+  # Default action returns 404 - each app-service-stack adds a ListenerRule
+  # with a path-based condition that forwards to its own TargetGroup.
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "404"
+            ContentType: application/json
+            MessageBody: '{"error":"not found"}'
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+
+  EcsClusterName:
+    Description: "ECS Cluster name - imported by app-service-stack"
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-ecs-cluster-name"
+
+  EcsClusterArn:
+    Description: "ECS Cluster ARN - imported by app-service-stack"
+    Value: !GetAtt EcsCluster.Arn
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-ecs-cluster-arn"
+
+  AlbArn:
+    Description: "ALB ARN - imported by app-service-stack"
+    Value: !Ref ALB
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-alb-arn"
+
+  AlbListenerArn:
+    Description: "ALB Listener ARN - imported by app-service-stack to attach ListenerRules"
+    Value: !Ref ALBListener
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-alb-listener-arn"
+
+  AlbDnsName:
+    Description: "Public DNS of the Application Load Balancer"
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-alb-dns"
