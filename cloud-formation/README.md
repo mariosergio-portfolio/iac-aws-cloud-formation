@@ -1,4 +1,4 @@
-# Generic AWS CloudFormation — ECS Fargate Microservices
+# Reusable AWS CloudFormation — ECS Fargate Microservices
 
 Reusable, parameter-driven **AWS CloudFormation** templates to host one or many containerized
 microservices on **ECS Fargate**, with a shared network and load balancer, a per-service
@@ -132,7 +132,7 @@ cloud-formation/
 
 - An AWS account and the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), authenticated (`aws login` or any profile).
 - A **GitHub CodeConnections** connection in `AVAILABLE` state (AWS Console → CodeBuild → Source credentials → GitHub → OAuth). Its ARN is passed as `GitHubConnectionArn`; the template has no default for it.
-- A `Dockerfile` and a `buildspec.yml` in the application repository (the buildspec file name is the `BuildSpecFile` parameter).
+- A `Dockerfile` and a **`buildspec.yml` in the application repository** (your service). See [Your application needs a `buildspec.yml`](#your-application-needs-a-buildspecyml) below.
 
 Set the shared variables once per shell session (PowerShell shown; the same values apply to any shell).
 Don't hardcode account IDs, ARNs or tokens in committed files.
@@ -147,6 +147,43 @@ $GitHubConnectionArn = "<arn:aws:codeconnections:...>"   # create it first: RUN-
 $GitHubOwner         = "<github org or user>"
 $GitHubRepo          = "<repository name>"
 $GitHubBranch        = "main"
+```
+
+### Your application needs a `buildspec.yml`
+
+These templates only create the build project. **The build steps come from your application (service)
+repository:** it must contain a `buildspec.yml` at the repository root (or at the path you pass as the
+`BuildSpecFile` parameter of the CodeBuild stack) and a `Dockerfile`. Without it, CodeBuild has nothing to run
+and no image reaches ECR.
+
+The CodeBuild project (privileged mode, so Docker works) provides these environment variables to your buildspec:
+
+| Variable | Value |
+|---|---|
+| `AWS_DEFAULT_REGION` | Region of the stack |
+| `AWS_ACCOUNT_ID` | The `AwsAccountId` parameter |
+| `ECR_REPO` | `<env>-<product>-<service>-repo` |
+| `IMAGE_TAG` | `latest` by default; override it per build with `--environment-variables-override name=IMAGE_TAG,...` |
+
+Your buildspec must log in to ECR, build the image, and **push it tagged with `$IMAGE_TAG`**. The auto-deploy
+Lambda reads `IMAGE_TAG` from the finished build and rolls the ECS service to that tag. The ECR repository has
+immutable tags, so each build needs a tag that hasn't been pushed before.
+
+A minimal example (adapt it to your build; it is not tested against this repository):
+
+```yaml
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+  build:
+    commands:
+      - docker build -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG .
+  post_build:
+    commands:
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG
 ```
 
 ---

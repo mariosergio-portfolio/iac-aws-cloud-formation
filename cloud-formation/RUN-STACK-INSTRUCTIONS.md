@@ -19,6 +19,9 @@ for **PowerShell** (backtick `` ` `` line continuation). Run them from the `clou
 
 - Install the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
 - Authenticate with `aws login` (OAuth) or any configured profile.
+- Your application (service) repository must contain a **`buildspec.yml`** and a `Dockerfile`. The CodeBuild
+  stack only creates the project; the build steps come from your `buildspec.yml`. See
+  [README.md](README.md#your-application-needs-a-buildspecyml) for what it must do and an example.
 
 > **Never hardcode values directly in a command.** Account IDs, ARNs and tokens are sensitive;
 > keep them in shell variables (section 3).
