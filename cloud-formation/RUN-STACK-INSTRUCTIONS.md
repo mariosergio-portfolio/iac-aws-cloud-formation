@@ -66,7 +66,7 @@ $ProductName         = "<your product name>"
 $StackPrefix         = "$Environment-$ProductName"            # e.g. "dev-yourproduct"
 $AppServiceName      = "<your app service name>"
 $AwsAccountId        = "<12-digit AWS account ID>"
-$GitHubConnectionArn = "<arn:aws:codeconnections:...>"
+$GitHubConnectionArn = "<arn:aws:codeconnections:...>"   # create it first: section 2, "GitHub connection (private repositories)"
 $GitHubOwner         = "<GitHub org or user>"
 $GitHubRepo          = "<GitHub repository name>"
 $GitHubBranch        = "main"
@@ -86,7 +86,6 @@ $GitHubBranch        = "main"
 | 6 | Per service | SSM parameter with the image tag | (not a stack) |
 | 7 | Per service | Task definition, ECS service, ALB rule | `$StackPrefix-$AppServiceName-ecs-service` |
 | 8 | Per service | EventBridge rule and Lambda that redeploy on build success | `$StackPrefix-$AppServiceName-pipeline` |
-| 9 | Per service | Verification | (not a stack) |
 
 ### Step 1: VPC
 
@@ -243,23 +242,8 @@ aws cloudformation deploy `
     AppServiceName=$AppServiceName
 ```
 
-### Step 9: Verify the pipeline
+To confirm the pipeline works after a build, see [Verify the pipeline](#verify-the-pipeline) in section 7.
 
-Check the Lambda logs after a build to confirm the auto-deploy fired:
-
-```powershell
-aws logs tail "/aws/lambda/$StackPrefix-$AppServiceName-deploy-trigger" --follow --region us-east-1
-```
-
-Check the current deployed image tag:
-
-```powershell
-aws ssm get-parameter `
-  --name "/$StackPrefix-$AppServiceName-imageTag" `
-  --region us-east-1 `
-  --query "Parameter.Value" `
-  --output text
-```
 
 ---
 
@@ -366,6 +350,24 @@ aws codebuild batch-get-builds `
   --query "builds[0].{status:buildStatus,phase:currentPhase}"
 ```
 
+### Verify the pipeline
+
+Check the Lambda logs after a build to confirm the auto-deploy fired:
+
+```powershell
+aws logs tail "/aws/lambda/$StackPrefix-$AppServiceName-deploy-trigger" --follow --region us-east-1
+```
+
+Check the current deployed image tag:
+
+```powershell
+aws ssm get-parameter `
+  --name "/$StackPrefix-$AppServiceName-imageTag" `
+  --region us-east-1 `
+  --query "Parameter.Value" `
+  --output text
+```
+
 ### Restore a specific task definition revision
 
 Omit `--task-definition` to use the latest revision.
@@ -402,4 +404,18 @@ aws ecs list-task-definitions `
 aws ecs describe-task-definition `
   --task-definition "$StackPrefix-$AppServiceName-task:5" `
   --query 'taskDefinition.containerDefinitions[*].image'
+```
+
+### Look up the database connection details and credentials
+
+Use these commands to get the real values of a deployed stack. The second one returns the **secret
+database credentials** from Secrets Manager, so treat the output as sensitive: don't paste it into
+tickets or commit it. The commands use the shared variables from [section 3](#3-shared-variables).
+
+```powershell
+# Look up the real values for the deployed stack (endpoint, port, database name, secret ARN):
+aws cloudformation describe-stacks --stack-name "$StackPrefix-$AppServiceName-rds" --query "Stacks[0].Outputs" --region us-east-1
+
+# Get the secret database credentials:
+aws secretsmanager get-secret-value --secret-id "$StackPrefix-$AppServiceName-db-secret" --query SecretString --output text --region us-east-1
 ```

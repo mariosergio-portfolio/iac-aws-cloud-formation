@@ -74,7 +74,7 @@ GitHub ──► CodeBuild ──► ECR
   `<ecr-uri>:{{resolve:ssm:/<env>-<product>-<service>-imageTag}}`. There is no `ImageTag`
   parameter on the service stack.
 - **`DesiredCount` defaults to `0`.** CloudFormation creates the service without starting tasks;
-  you start and scale them explicitly (see [Operations](#operations)).
+  you start and scale them explicitly (see [`RUN-STACK-INSTRUCTIONS.md`](RUN-STACK-INSTRUCTIONS.md)).
 - **Task definitions are retained** (`DeletionPolicy: Retain`) so old revisions stay available for rollback.
 - **Tasks run in private subnets** with `awsvpc` networking and target type `ip`; only the ALB is public.
 - **No plaintext secrets.** The database password is generated and stored in Secrets Manager;
@@ -126,11 +126,11 @@ Don't hardcode account IDs, ARNs or tokens in committed files.
 
 ```powershell
 $Environment         = "dev"                      # dev | staging | prod
-$ProductName         = "<product>"
-$AppServiceName      = "<service>"
-$StackPrefix         = "$Environment-$ProductName"
+$ProductName         = "portfolio"
+$AppServiceName      = "webstore"
+$StackPrefix         = "$Environment-$ProductName"   # -> "dev-portfolio"
 $AwsAccountId        = "<12-digit AWS account id>"
-$GitHubConnectionArn = "<arn:aws:codeconnections:...>"
+$GitHubConnectionArn = "<arn:aws:codeconnections:...>"   # create it first: RUN-STACK-INSTRUCTIONS.md, "2. GitHub connection (private repositories)"
 $GitHubOwner         = "<github org or user>"
 $GitHubRepo          = "<repository name>"
 $GitHubBranch        = "main"
@@ -157,7 +157,7 @@ Run from the `cloud-formation/` folder. Every `aws cloudformation deploy` call u
 | 8 | Service | `per-service/aws-pipeline-stack.yml` | `$StackPrefix-$AppServiceName-pipeline` |
 
 Example for one stack (all others follow the same shape; see
-[`RUN-STACK-INSTRUCTIONS.md`](cloud-formation/RUN-STACK-INSTRUCTIONS.md) for every command with its parameters):
+[`RUN-STACK-INSTRUCTIONS.md`](RUN-STACK-INSTRUCTIONS.md) for every command with its parameters):
 
 ```powershell
 aws cloudformation deploy `
@@ -166,6 +166,29 @@ aws cloudformation deploy `
   --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND `
   --parameter-overrides Environment=$Environment ProductName=$ProductName
 ```
+
+---
+#### AWS WEB CONSOLE
+
+This is the CloudFormation console after running the deploy steps above for one real example:
+environment `dev`, product `portfolio`, service `webstore` (`$StackPrefix` = `dev-portfolio`).
+The 8 steps produce **7 stacks**, because step 6 is an SSM parameter and not a stack. All of them
+show a `*_COMPLETE` status.
+
+| Tier | Stack | Step |
+|---|---|---|
+| Product | `dev-portfolio-vpc` | 1 |
+| Product | `dev-portfolio-ecs-infra` | 2 |
+| Service | `dev-portfolio-webstore-codebuild` | 3 |
+| Service | `dev-portfolio-webstore-iam` | 4 |
+| Service | `dev-portfolio-webstore-rds` | 5 |
+| Service | `dev-portfolio-webstore-ecs-service` | 7 |
+| Service | `dev-portfolio-webstore-pipeline` | 8 |
+
+The two product-tier stacks are shared. A second microservice would add its own five service-tier stacks
+next to these, named `dev-portfolio-<service>-…`.
+
+![AWS CloudFormation console listing the seven dev-portfolio stacks, all in a COMPLETE status](aws-cloud-formation-web-console.png)
 
 ### First deploy of a service
 
@@ -186,6 +209,12 @@ aws cloudformation deploy `
      --service "$StackPrefix-$AppServiceName-service" `
      --desired-count 1 --force-new-deployment
    ```
+
+   The screenshot below is the result of this step in the `dev` / `portfolio` / `webstore` example: the
+   ECS console for `dev-portfolio-cluster`, where the service tasks are **Running** as Fargate tasks
+   (here 3 running, 0 pending) from task definition `dev-portfolio-webstore-task`.
+
+   ![ECS console for dev-portfolio-cluster listing the webstore Fargate tasks in a Running state](ecs-fargate-instances.png)
 
 After that, every successful CodeBuild build redeploys the service automatically.
 
@@ -220,30 +249,6 @@ the product tier's exports are in use.
 | `DeletionProtection`, `BackupRetentionDays` | rds | `false`, `7` | Enable protection in `prod` |
 
 Each template's `Parameters` section is the source of truth for the full list.
-
----
-
-## Operations
-
-```powershell
-# Current image tag
-aws ssm get-parameter --name "/$StackPrefix-$AppServiceName-imageTag" --query "Parameter.Value" --output text
-
-# ALB DNS name
-aws cloudformation describe-stacks --stack-name "$StackPrefix-ecs-infra" `
-  --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" --output text
-
-# Follow the auto-deploy Lambda
-aws logs tail "/aws/lambda/$StackPrefix-$AppServiceName-deploy-trigger" --follow
-
-# Roll back to a previous task definition revision
-aws ecs update-service --cluster "$StackPrefix-cluster" `
-  --service "$StackPrefix-$AppServiceName-service" `
-  --task-definition "$StackPrefix-$AppServiceName-task:<revision>" --force-new-deployment
-```
-
-More operational commands (build status, ECR images, task definitions, scaling through
-CloudFormation) are in [`RUN-STACK-INSTRUCTIONS.md`](cloud-formation/RUN-STACK-INSTRUCTIONS.md).
 
 ---
 
