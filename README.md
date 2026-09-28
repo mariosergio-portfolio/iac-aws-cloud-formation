@@ -100,10 +100,15 @@ The editable source is [`docs/diagram/aws-architecture.drawio`](docs/diagram/aws
 ## Repository layout
 
 ```
-cloud-formation/
+README.md
+RUN-STACK-INSTRUCTIONS.md               # full deploy / operate command reference (PowerShell)
+docs/
+├── aws-cloud-formation-web-console.png   # CloudFormation console screenshot
+├── ecs-fargate-instances.png             # ECS console screenshot
+└── diagram/                              # architecture diagram: source, generator, exports
+cloud-formation-stacks/
 ├── aws-vpc-stack.yml               # product tier: network
 ├── aws-ecs-infra-stack.yml         # product tier: ECS cluster + ALB
-├── RUN-STACK-INSTRUCTIONS.md       # full deploy / operate command reference (PowerShell)
 └── per-service/
     ├── aws-codebuild-stack.yml     # ECR + CodeBuild
     ├── aws-iam-stack.yml           # ECS roles
@@ -190,7 +195,7 @@ phases:
 
 ## Deploy
 
-Run from the `cloud-formation/` folder. Every `aws cloudformation deploy` call uses
+Run from the `cloud-formation-stacks/` folder. Every `aws cloudformation deploy` call uses
 `--capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND` and `--region <region>`.
 
 ### Order
@@ -259,14 +264,37 @@ next to these, named `dev-portfolio-<service>-…`.
      --service "$StackPrefix-$AppServiceName-service" `
      --desired-count 3 --force-new-deployment
    ```
+After that, every successful CodeBuild build redeploys the service automatically.
 
-   The screenshot below is the result of this step in the `dev` / `portfolio` / `webstore` example: the
+### AWS WEB Console 
+   The screenshots below is the result of this step in the `dev` / `portfolio` / `webstore`.
+
+#### ECS / APPLICATON INSTANCES       
    ECS console for `dev-portfolio-cluster`, where the service tasks are **Running** as Fargate tasks
    (here 3 running, 0 pending) from task definition `dev-portfolio-webstore-task`.
 
    ![ECS console for dev-portfolio-cluster listing the webstore Fargate tasks in a Running state](docs/ecs-fargate-instances.png)
 
-After that, every successful CodeBuild build redeploys the service automatically.
+
+#### RDS (Aurora PostgreSQL)
+
+The screenshot shows the RDS console (**Aurora and RDS → Databases**) after the RDS stack was deployed for the
+`dev` / `portfolio` / `webstore` example. The stack creates one Aurora PostgreSQL cluster per service, and the list
+has the two entries you should expect for it:
+
+| DB identifier | Role | Notes |
+|---|---|---|
+| `dev-portfolio-webstore-cluster` | Regional cluster | Aurora PostgreSQL, 1 instance, status **Available** |
+| `dev-portfolio-webstore-instance-1` | Writer instance | Aurora Serverless v2 instance in `us-east-1a`, status **Available** |
+
+![RDS console listing the dev-portfolio-webstore Aurora cluster and its writer instance, both Available](docs/aws-rds.png)
+
+The cluster is private (no public access, port 5432 open only to the ECS tasks), but you can still query it from the
+Console. The RDS stack enables the **RDS Data API** (`EnableHttpEndpoint: true`), which the **Query editor** uses over
+HTTPS, so it needs no network path to port 5432. In the Query editor choose **Connect with a Secrets Manager ARN** and
+select the `$StackPrefix-$AppServiceName-db-secret` secret, so you never type the credentials.
+
+> For anything beyond quick checks, prefer a proper migration tool over ad-hoc edits in the Query editor.
 
 ### Adding another microservice
 

@@ -37,7 +37,7 @@ Description: "Per-service - Aurora PostgreSQL cluster, subnet group, security gr
 #
 # Deploy:
 #   aws cloudformation deploy \
-#     --template-file cloud-formation/per-service/aws-rds-aurora-stack.yml \
+#     --template-file cloud-formation-stacks/per-service/aws-rds-aurora-stack.yml \
 #     --stack-name <env>-<product>-<component>-rds \
 #     --parameter-overrides \
 #         ProductName=webstore \

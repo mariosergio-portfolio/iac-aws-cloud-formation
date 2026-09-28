@@ -1,7 +1,7 @@
 # Run the CloudFormation Stacks
 
 Command reference for deploying and operating the stacks in this folder. Commands are written
-for **PowerShell** (backtick `` ` `` line continuation). Run them from the `cloud-formation/` folder.
+for **PowerShell** (backtick `` ` `` line continuation). Run them from the `cloud-formation-stacks/` folder (`cd cloud-formation-stacks` from the repository root), where the template paths below resolve.
 
 **Contents**
 

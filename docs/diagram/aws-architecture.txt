@@ -184,7 +184,7 @@ Deploy order
    e. dev-portfolio-<service>-service    (imports vpc + ecs-infra + iam + codebuild + rds outputs)
    f. dev-portfolio-<service>-pipeline   (imports codebuild + service outputs)
 
-Templates referenced above (under cloud-formation/):
+Templates referenced above (under cloud-formation-stacks/):
   aws-vpc-stack.yml
   aws-ecs-infra-stack.yml
   per-service/aws-codebuild-stack.yml
