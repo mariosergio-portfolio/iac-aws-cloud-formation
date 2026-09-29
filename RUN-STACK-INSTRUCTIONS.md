@@ -73,6 +73,7 @@ $GitHubConnectionArn = "<arn:aws:codeconnections:...>"   # create it first: sect
 $GitHubOwner         = "<GitHub org or user>"
 $GitHubRepo          = "<GitHub repository name>"
 $GitHubBranch        = "main"
+$ALBListenerRulePriority = 10                             # unique per service on the shared ALB (e.g. 10, 20, 30...)
 ```
 
 ---
@@ -207,7 +208,7 @@ Task definition, ECS service and ALB listener rule. Once per service.
 > `server.servlet.context-path=/$AppServiceName`. Passing the combined path would double it
 > (for example `/webstore/webstore/actuator/health`).
 >
-> **`ListenerRulePriority`** must be unique for every service on the shared ALB.
+> **`ListenerRulePriority`** (`$ALBListenerRulePriority`) must be unique for every service on the shared ALB.
 
 ```powershell
 aws cloudformation deploy `
@@ -219,7 +220,7 @@ aws cloudformation deploy `
     Environment=$Environment `
     ProductName=$ProductName `
     AppServiceName=$AppServiceName `
-    ListenerRulePriority=10 `
+    ListenerRulePriority=$ALBListenerRulePriority `
     AwsAccountId=$AwsAccountId
 ```
 
