@@ -45,6 +45,9 @@ Examples, checked against `us-east-1`:
 | Amazon Nova Pro | `amazon.nova-pro-v1:0` | _(empty), or `us.amazon.nova-pro-v1:0`_ |
 | Mistral Large 3 | `mistral.mistral-large-3-675b-instruct` | _(empty)_ |
 
+To allow several models for one service, deploy the stack once per model with a different stack name; the model
+ID is part of the policy and export names, so the stacks do not clash.
+
 Availability changes by region and over time. List what your account can call with
 `aws bedrock list-foundation-models` and `aws bedrock list-inference-profiles`; the `modelLifecycle` status
 (`ACTIVE` or `LEGACY`) shows whether a model is being phased out. Each model also

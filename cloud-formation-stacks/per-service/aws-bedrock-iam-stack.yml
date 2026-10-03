@@ -10,6 +10,11 @@ Description: "Generic - IAM permissions for a service to invoke Amazon Bedrock m
 #   - Attaches that policy to the service's existing ECS Task Role
 #     (created by aws-iam-stack.yml)
 #
+# One stack per model: the model ID is part of the policy name and of the export name (with "." and
+# ":" replaced by "-", and "*" by "all"), so a service can run several of these stacks side by side,
+# each with its own stack name. Every stack attaches one more managed policy to the same task role,
+# and an IAM role allows 10 managed policies by default.
+#
 # Kept separate from aws-iam-stack.yml so only services that call Bedrock get
 # these permissions. Deploy it AFTER aws-iam-stack.yml for the same service.
 #
@@ -23,7 +28,7 @@ Description: "Generic - IAM permissions for a service to invoke Amazon Bedrock m
 # Deploy:
 #   aws cloudformation deploy \
 #     --template-file ./per-service/aws-bedrock-iam-stack.yml \
-#     --stack-name <env>-<product>-<service>-bedrock-iam \
+#     --stack-name <env>-<product>-<service>-bedrock-iam-<model-label> \
 #     --capabilities CAPABILITY_NAMED_IAM \
 #     --parameter-overrides \
 #         ProductName=my-product \
@@ -55,6 +60,8 @@ Parameters:
   BedrockModelId:
     Type: String
     Default: "*"
+    AllowedPattern: '^(\*|[a-zA-Z0-9][a-zA-Z0-9._:-]*)$'
+    ConstraintDescription: "Use * or a model ID such as ai21.jamba-1-5-mini-v1:0."
     Description: >
       Foundation model ID the service may invoke, without ARN prefix
       (e.g. anthropic.claude-haiku-4-5-20251001-v1:0, ai21.jamba-1-5-mini-v1:0,
@@ -71,6 +78,8 @@ Parameters:
 
 Conditions:
 
+  AllModels: !Equals [!Ref BedrockModelId, "*"]
+
   HasInferenceProfile: !Not [!Equals [!Ref InferenceProfileId, ""]]
 
 Resources:
@@ -81,8 +90,10 @@ Resources:
   BedrockInvokePolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: !Sub "${Environment}-${ProductName}-${AppServiceName}-bedrock-invoke-policy"
-      Description: !Sub "Allows ${AppServiceName} (${Environment}) to invoke Amazon Bedrock models"
+      ManagedPolicyName: !Sub
+        - "${Environment}-${ProductName}-${AppServiceName}-bedrock-invoke-${ModelSlug}-policy"
+        - ModelSlug: !If [AllModels, "all", !Join ["-", !Split [":", !Join ["-", !Split [".", !Ref BedrockModelId]]]]]
+      Description: !Sub "Allows ${AppServiceName} (${Environment}) to invoke Amazon Bedrock model ${BedrockModelId}"
       Roles:
         - !Sub "${Environment}-${ProductName}-${AppServiceName}-ecs-task-role"
       PolicyDocument:
@@ -109,4 +120,6 @@ Outputs:
     Description: "Bedrock invoke managed policy ARN"
     Value: !Ref BedrockInvokePolicy
     Export:
-      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-bedrock-invoke-policy-arn"
+      Name: !Sub
+        - "${Environment}-${ProductName}-${AppServiceName}-bedrock-invoke-${ModelSlug}-policy-arn"
+        - ModelSlug: !If [AllModels, "all", !Join ["-", !Split [":", !Join ["-", !Split [".", !Ref BedrockModelId]]]]]
