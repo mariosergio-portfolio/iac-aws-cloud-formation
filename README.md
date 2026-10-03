@@ -18,9 +18,39 @@ product, environment (`dev` / `staging` / `prod`) and service.
 | Shared ECS cluster + internet-facing Application Load Balancer | `aws-ecs-infra-stack.yml` |
 | Docker build from GitHub → ECR (immutable tags, scan on push) | `per-service/aws-codebuild-stack.yml` |
 | ECS task execution role + task role | `per-service/aws-iam-stack.yml` |
+| Amazon Bedrock invoke permissions for the task role, for any model provider (optional) | `per-service/aws-bedrock-iam-stack.yml` |
 | Aurora PostgreSQL Serverless v2, managed secret, subnet group, SG | `per-service/aws-rds-aurora-stack.yml` |
 | Task definition, ECS service, target group, ALB path rule | `per-service/aws-ecs-service-stack.yml` |
 | Auto-redeploy on every successful build (EventBridge + Lambda) | `per-service/aws-pipeline-stack.yml` |
+
+---
+
+## Amazon Bedrock models
+
+A service that calls Amazon Bedrock gets its permissions from the optional `aws-bedrock-iam-stack.yml`.
+It is model-agnostic: it works for Anthropic Claude, AI21 Jamba, Amazon Nova, Mistral and the other
+providers Bedrock offers, because you choose the model with two parameters.
+
+| Parameter | What to set |
+|---|---|
+| `BedrockModelId` | The foundation model ID, e.g. `ai21.jamba-1-5-mini-v1:0`. Default `*` allows every model; set one for least privilege. |
+| `InferenceProfileId` | Only for models that cannot be called directly and need a (cross-region) inference profile, e.g. `us.anthropic.claude-haiku-4-5-20251001-v1:0`. Leave empty otherwise. |
+
+Examples, checked against `us-east-1`:
+
+| Provider | `BedrockModelId` | `InferenceProfileId` |
+|---|---|---|
+| Anthropic Claude Haiku 4.5 | `anthropic.claude-haiku-4-5-20251001-v1:0` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| AI21 Jamba 1.5 Mini (marked `LEGACY` by Bedrock, so it may be retired) | `ai21.jamba-1-5-mini-v1:0` | _(empty)_ |
+| Amazon Nova Pro | `amazon.nova-pro-v1:0` | _(empty), or `us.amazon.nova-pro-v1:0`_ |
+| Mistral Large 3 | `mistral.mistral-large-3-675b-instruct` | _(empty)_ |
+
+Availability changes by region and over time. List what your account can call with
+`aws bedrock list-foundation-models` and `aws bedrock list-inference-profiles`; the `modelLifecycle` status
+(`ACTIVE` or `LEGACY`) shows whether a model is being phased out. Each model also
+needs model access in the Bedrock console, and quotas (requests and tokens per minute and per day) are
+set per model. Anthropic models additionally need a one-time use case form; see
+[RUN-STACK-INSTRUCTIONS.md](RUN-STACK-INSTRUCTIONS.md#step-4b-bedrock-iam-optional).
 
 ---
 

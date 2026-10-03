@@ -183,6 +183,23 @@ aws cloudformation deploy `
 
 Leave `InferenceProfileId` out if the service calls the foundation model directly.
 
+The stack works for any Bedrock model provider. Parameter values for some common models (checked
+against `us-east-1`; availability changes, so confirm with `aws bedrock list-foundation-models` and
+`aws bedrock list-inference-profiles`; the `modelLifecycle` status shows `ACTIVE` or `LEGACY`):
+
+| Model | `BedrockModelId` | `InferenceProfileId` |
+|---|---|---|
+| Anthropic Claude Haiku 4.5 | `anthropic.claude-haiku-4-5-20251001-v1:0` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| Anthropic Claude Sonnet 4.5 | `anthropic.claude-sonnet-4-5-20250929-v1:0` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` |
+| AI21 Jamba 1.5 Mini (`LEGACY`, may be retired) | `ai21.jamba-1-5-mini-v1:0` | _(leave out)_ |
+| Amazon Nova Pro | `amazon.nova-pro-v1:0` | _(leave out, or `us.amazon.nova-pro-v1:0`)_ |
+| Mistral Large 3 | `mistral.mistral-large-3-675b-instruct` | _(leave out)_ |
+
+Whatever the provider, the service must be configured with the same model (for `customers-api`, the
+`AWS_BEDROCK_MODEL_ID` variable; its default is `ai21.jamba-1-5-mini-v1:0`), model access must be enabled for
+it in the Bedrock console, and its quotas (requests and tokens per minute and per day) are set per model.
+The use case form below applies to Anthropic models only.
+
 ### Step 5: RDS Aurora
 
 Aurora PostgreSQL Serverless v2 cluster, DB secret, subnet group and security group. Once per service.
