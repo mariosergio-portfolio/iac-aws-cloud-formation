@@ -447,3 +447,47 @@ aws cloudformation describe-stacks --stack-name "$StackPrefix-$AppServiceName-rd
 # Get the secret database credentials:
 aws secretsmanager get-secret-value --secret-id "$StackPrefix-$AppServiceName-db-secret" --query SecretString --output text --region us-east-1
 ```
+
+### Bedrock: Anthropic use case form and model check
+
+Anthropic models on Bedrock need the **use case details form** submitted once per account. Until it is, the
+service fails with `Model use case details have not been submitted for this account` (HTTP 404). After
+submitting, allow up to 15 minutes. Run these in order.
+
+Check whether the form is already on file (a `ResourceNotFoundException` means it has not been submitted):
+
+```powershell
+aws bedrock get-use-case-for-model-access --region us-east-1
+```
+
+Submit the form. `--form-data` is base64-encoded JSON. The field names below are not verified, so compare
+them with the console form (Bedrock → Model catalog → an Anthropic model) first, or submit it in the console instead:
+
+```powershell
+$FormJson = '{"companyName":"<name>","companyWebsite":"<url>","intendedUsers":"0","industryOption":"Technology","otherIndustryOption":"","useCases":"<describe the use case>"}'
+$FormData = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($FormJson))
+
+aws bedrock put-use-case-for-model-access `
+  --form-data $FormData `
+  --region us-east-1
+```
+
+Test the model directly, without going through the service. It returns the same error until the form takes
+effect, then a reply:
+
+```powershell
+$Messages = '[{\"role\":\"user\",\"content\":[{\"text\":\"hi\"}]}]'
+
+aws bedrock-runtime converse `
+  --model-id us.anthropic.claude-sonnet-4-5-20250929-v1:0 `
+  --messages $Messages `
+  --region us-east-1
+```
+
+If the test fails with an access error instead, confirm the inference profile is available in the region:
+
+```powershell
+aws bedrock list-inference-profiles `
+  --region us-east-1 `
+  --query "inferenceProfileSummaries[?contains(inferenceProfileId,'claude-sonnet-4-5')].inferenceProfileId"
+```
