@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Generic - IAM permissions for a service to invoke Amazon Bedrock models"
+
+# =============================================================================
+# per-service/aws-bedrock-iam-stack.yml
+#
+# Creates:
+#   - A managed policy that allows bedrock:InvokeModel / InvokeModelWithResponseStream
+#     (the Converse API is authorised by these same actions) on the allowed models
+#   - Attaches that policy to the service's existing ECS Task Role
+#     (created by aws-iam-stack.yml)
+#
+# Kept separate from aws-iam-stack.yml so only services that call Bedrock get
+# these permissions. Deploy it AFTER aws-iam-stack.yml for the same service.
+#
+# Model access must also be enabled in the Bedrock console (Model access) for
+# the model in BedrockModelId, in each region used.
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file ./per-service/aws-bedrock-iam-stack.yml \
+#     --stack-name <env>-<product>-<service>-bedrock-iam \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides \
+#         ProductName=my-product \
+#         Environment=prod \
+#         AppServiceName=customers-api \
+#         BedrockModelId=anthropic.claude-sonnet-4-5-20250929-v1:0 \
+#         InferenceProfileId=us.anthropic.claude-sonnet-4-5-20250929-v1:0 \
+#     --region us-east-1
+# =============================================================================
+
+Parameters:
+
+  ProductName:
+    Type: String
+    Description: "Application name - used to name and tag all resources."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment."
+
+  AppServiceName:
+    Type: String
+    Description: >
+      Name of the containerized microservice. Must match the AppServiceName used by
+      aws-iam-stack.yml, whose ECS Task Role receives the Bedrock policy.
+
+  BedrockModelId:
+    Type: String
+    Default: "*"
+    Description: >
+      Foundation model ID the service may invoke, without ARN prefix
+      (e.g. anthropic.claude-sonnet-4-5-20250929-v1:0). Use * to allow all models.
+
+  InferenceProfileId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional cross-region inference profile ID the service may use
+      (e.g. us.anthropic.claude-sonnet-4-5-20250929-v1:0). Leave empty if the
+      service calls the foundation model directly. A profile routes requests to
+      several regions, so the foundation-model statement below uses a wildcard region.
+
+Conditions:
+
+  HasInferenceProfile: !Not [!Equals [!Ref InferenceProfileId, ""]]
+
+Resources:
+
+  # ── Bedrock invoke policy ────────────────────────────────────────────────────
+  # Foundation-model ARNs have no account ID and use a wildcard region because
+  # inference profiles route requests to other regions.
+  BedrockInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${Environment}-${ProductName}-${AppServiceName}-bedrock-invoke-policy"
+      Description: !Sub "Allows ${AppServiceName} (${Environment}) to invoke Amazon Bedrock models"
+      Roles:
+        - !Sub "${Environment}-${ProductName}-${AppServiceName}-ecs-task-role"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeFoundationModels
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: !If
+              - HasInferenceProfile
+              - - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockModelId}"
+                - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/${InferenceProfileId}"
+              - - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockModelId}"
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+
+  BedrockInvokePolicyArn:
+    Description: "Bedrock invoke managed policy ARN"
+    Value: !Ref BedrockInvokePolicy
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-bedrock-invoke-policy-arn"
