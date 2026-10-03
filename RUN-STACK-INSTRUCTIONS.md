@@ -86,7 +86,7 @@ $ALBListenerRulePriority = 10                             # unique per service o
 | 2 | Once per product | ECS cluster, ALB, listener | `$StackPrefix-ecs-infra` |
 | 3 | Per service | ECR repository, CodeBuild project | `$StackPrefix-$AppServiceName-codebuild` |
 | 4 | Per service | ECS task execution role and task role | `$StackPrefix-$AppServiceName-iam` |
-| 4b | Per service (optional) | Amazon Bedrock invoke permissions for the task role | `$StackPrefix-$AppServiceName-bedrock-iam` |
+| 4b | Per service (optional) | Amazon Bedrock invoke permissions for the task role | `$StackPrefix-$AppServiceName-bedrock-iam-<model-label>` |
 | 5 | Per service | Aurora PostgreSQL Serverless v2, DB secret | `$StackPrefix-$AppServiceName-rds` |
 | 6 | Per service | SSM parameter with the image tag | (not a stack) |
 | 7 | Per service | Task definition, ECS service, ALB rule | `$StackPrefix-$AppServiceName-ecs-service` |
@@ -169,7 +169,7 @@ task role from step 4, so deploy it **after** step 4. Enable the model in the Be
 
 ```powershell
 aws cloudformation deploy `
-  --stack-name "$StackPrefix-$AppServiceName-bedrock-iam" `
+  --stack-name "$StackPrefix-$AppServiceName-bedrock-iam-jamba-mini" `
   --template-file ./per-service/aws-bedrock-iam-stack.yml `
   --region us-east-1 `
   --capabilities CAPABILITY_NAMED_IAM `
@@ -182,6 +182,12 @@ aws cloudformation deploy `
 ```
 
 Leave `InferenceProfileId` out if the service calls the foundation model directly.
+
+**One stack per model.** The model ID is part of the policy name and of the export name (for example
+`...-bedrock-invoke-ai21-jamba-1-5-mini-v1-0-policy`), so to allow another model run the same command again
+with that model's `BedrockModelId` and a different stack name, for example
+`$StackPrefix-$AppServiceName-bedrock-iam-nova-pro`. Each stack attaches one more managed policy to the task role,
+and an IAM role allows 10 managed policies by default.
 
 The stack works for any Bedrock model provider. Parameter values for some common models (checked
 against `us-east-1`; availability changes, so confirm with `aws bedrock list-foundation-models` and
@@ -327,7 +333,7 @@ aws ecs update-service `
 
 ### Delete stacks
 
-Delete in reverse order of deployment: `ecs-service`, `pipeline`, `rds`, `bedrock-iam` (if deployed), `iam`, `codebuild` (per service),
+Delete in reverse order of deployment: `ecs-service`, `pipeline`, `rds`, `bedrock-iam-<model-label>` stacks (if deployed), `iam`, `codebuild` (per service),
 then `ecs-infra` and `vpc` (per product). Example for one service stack:
 
 ```powershell
