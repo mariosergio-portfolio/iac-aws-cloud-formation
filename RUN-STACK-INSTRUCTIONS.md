@@ -86,6 +86,7 @@ $ALBListenerRulePriority = 10                             # unique per service o
 | 2 | Once per product | ECS cluster, ALB, listener | `$StackPrefix-ecs-infra` |
 | 3 | Per service | ECR repository, CodeBuild project | `$StackPrefix-$AppServiceName-codebuild` |
 | 4 | Per service | ECS task execution role and task role | `$StackPrefix-$AppServiceName-iam` |
+| 4b | Per service (optional) | Amazon Bedrock invoke permissions for the task role | `$StackPrefix-$AppServiceName-bedrock-iam` |
 | 5 | Per service | Aurora PostgreSQL Serverless v2, DB secret | `$StackPrefix-$AppServiceName-rds` |
 | 6 | Per service | SSM parameter with the image tag | (not a stack) |
 | 7 | Per service | Task definition, ECS service, ALB rule | `$StackPrefix-$AppServiceName-ecs-service` |
@@ -158,6 +159,29 @@ aws cloudformation deploy `
     ProductName=$ProductName `
     AppServiceName=$AppServiceName
 ```
+
+### Step 4b: Bedrock IAM (optional)
+
+Only for services that call Amazon Bedrock. Creates a managed policy with
+`bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream` and attaches it to the
+task role from step 4, so deploy it **after** step 4. Enable the model in the Bedrock console
+(Model access) first.
+
+```powershell
+aws cloudformation deploy `
+  --stack-name "$StackPrefix-$AppServiceName-bedrock-iam" `
+  --template-file ./per-service/aws-bedrock-iam-stack.yml `
+  --region us-east-1 `
+  --capabilities CAPABILITY_NAMED_IAM `
+  --parameter-overrides `
+    Environment=$Environment `
+    ProductName=$ProductName `
+    AppServiceName=$AppServiceName `
+    BedrockModelId=anthropic.claude-sonnet-4-5-20250929-v1:0 `
+    InferenceProfileId=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+```
+
+Leave `InferenceProfileId` out if the service calls the foundation model directly.
 
 ### Step 5: RDS Aurora
 
@@ -286,7 +310,7 @@ aws ecs update-service `
 
 ### Delete stacks
 
-Delete in reverse order of deployment: `ecs-service`, `pipeline`, `rds`, `iam`, `codebuild` (per service),
+Delete in reverse order of deployment: `ecs-service`, `pipeline`, `rds`, `bedrock-iam` (if deployed), `iam`, `codebuild` (per service),
 then `ecs-infra` and `vpc` (per product). Example for one service stack:
 
 ```powershell
