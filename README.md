@@ -22,7 +22,7 @@ product, environment (`dev` / `staging` / `prod`) and service.
 | Aurora PostgreSQL Serverless v2, managed secret, subnet group, SG | `per-service/aws-rds-aurora-stack.yml` |
 | Task definition, ECS service, target group, ALB path rule | `per-service/aws-ecs-service-stack.yml` |
 | Auto-redeploy on every successful build (EventBridge + Lambda) | `per-service/aws-pipeline-stack.yml` |
-| IoT Core (MQTT) → MSK (Kafka) → DynamoDB event pipeline (optional, separate set of stacks) | [`iot-async-dynamo/`](cloud-formation-stacks/iot-async-dynamo/README.md) |
+| IoT Core (MQTT) → MSK (Kafka) → DynamoDB event pipeline (optional, separate set of stacks) | [`iot-async-dynamo/`](cloud-formation-stacks/iot-async-dynamo/IOT-RUN-STACK-INSTRUCTIONS.md) |
 
 ---
 
@@ -143,7 +143,7 @@ docs/
 cloud-formation-stacks/
 ├── aws-vpc-stack.yml               # product tier: network
 ├── aws-ecs-infra-stack.yml         # product tier: ECS cluster + ALB
-├── iot-async-dynamo/               # optional: IoT Core + MSK + DynamoDB (own README)
+├── iot-async-dynamo/               # optional: IoT Core + MSK + DynamoDB (own run instructions)
 │   ├── aws-iot-core-stack.yml
 │   ├── aws-msk-stack.yml
 │   └── aws-dynamodb-stack.yml

@@ -335,7 +335,7 @@ aws ecs update-service `
 
 Delete in reverse order of deployment: `ecs-service`, `pipeline`, `rds`, `bedrock-iam-<model-label>` stacks (if deployed), `iam`, `codebuild` (per service),
 then `ecs-infra` and `vpc` (per product). The optional IoT / Kafka / DynamoDB stacks have their own teardown order in
-[cloud-formation-stacks/iot-async-dynamo/README.md](cloud-formation-stacks/iot-async-dynamo/README.md). Example for one service stack:
+[cloud-formation-stacks/iot-async-dynamo/IOT-RUN-STACK-INSTRUCTIONS.md](cloud-formation-stacks/iot-async-dynamo/IOT-RUN-STACK-INSTRUCTIONS.md). Example for one service stack:
 
 ```powershell
 aws cloudformation delete-stack --stack-name "$StackPrefix-$AppServiceName-ecs-service"
