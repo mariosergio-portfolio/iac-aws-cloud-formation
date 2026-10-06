@@ -21,6 +21,12 @@ Description: "Generic - AWS IoT Core (MQTT broker) device registry, device polic
 #       (epoch ms) in the sort key. Enabled when TelemetryTableName is not empty.
 #       Failed actions are written to a CloudWatch log group.
 #
+#   - (optional) Topic Rule: same topic  ->  Kafka (MSK), key = vehicleId (topic segment 4)
+#       Enabled when KafkaBootstrapServers is not empty. Uses a VPC rule destination and
+#       SASL/SCRAM-SHA-512 with the secret created by aws-msk-stack.yml, acks=all.
+#       Messages that cannot be delivered go to an SQS dead-letter queue (14 days) and
+#       a CloudWatch alarm fires on any rule failure.
+#
 # Topic convention:
 #   <env>/<product>/devices/<thingName>/telemetry     device -> cloud
 #   <env>/<product>/devices/<thingName>/commands/...  cloud  -> device
@@ -32,6 +38,13 @@ Description: "Generic - AWS IoT Core (MQTT broker) device registry, device polic
 #   aws iot attach-thing-principal --thing-name <thingName> --principal <certArn>
 # The MQTT endpoint is:  aws iot describe-endpoint --endpoint-type iot:Data-ATS
 #
+# Kafka rule - deploy aws-msk-stack.yml first, create the Kafka topic, then pass the SCRAM brokers:
+#   aws kafka get-bootstrap-brokers --cluster-arn <arn> --query BootstrapBrokerStringSaslScram --output text
+#
+# Depends on exports from (only when the Kafka rule is enabled):
+#   - aws-vpc-stack.yml  (VPC, private subnets)
+#   - aws-msk-stack.yml  (sg-msk, SCRAM secret, KMS key)
+#
 # Exports:
 #   - ${Environment}-${ProductName}-iot-device-policy-name
 #   - ${Environment}-${ProductName}-iot-thing-type-name
@@ -39,7 +52,7 @@ Description: "Generic - AWS IoT Core (MQTT broker) device registry, device polic
 #
 # Deploy:
 #   aws cloudformation deploy \
-#     --template-file cloud-formation-stacks/aws-iot-core-stack.yml \
+#     --template-file cloud-formation-stacks/iot-async-dynamo/aws-iot-core-stack.yml \
 #     --stack-name <env>-<product>-iot-core \
 #     --capabilities CAPABILITY_NAMED_IAM \
 #     --parameter-overrides \
@@ -65,7 +78,7 @@ Parameters:
     Type: String
     Default: ""
     Description: >
-      Name of an existing DynamoDB table (see per-service/aws-dynamodb-stack.yml) that receives
+      Name of an existing DynamoDB table (see aws-dynamodb-stack.yml) that receives
       device telemetry. Leave empty to skip the topic rule.
 
   TelemetryPartitionKeyName:
@@ -78,6 +91,23 @@ Parameters:
     Default: sk
     Description: "Sort key attribute of the telemetry table (Number - the table must be deployed with SortKeyType=N). Receives the arrival time in epoch ms."
 
+  KafkaBootstrapServers:
+    Type: String
+    Default: ""
+    Description: >
+      SASL/SCRAM bootstrap brokers of the MSK cluster (port 9096, comma separated).
+      Leave empty to skip the Kafka rule.
+
+  KafkaTopic:
+    Type: String
+    Default: vehicle-telemetry
+    Description: "Kafka topic that receives the telemetry. It must already exist (topics are not auto-created)."
+
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: "Optional SNS topic notified when the Kafka rule fails."
+
   LogRetentionDays:
     Type: Number
     Default: 7
@@ -85,6 +115,8 @@ Parameters:
     Description: "Retention of the IoT rule error log group (7 dev/test, 30 prod)."
 
 Conditions:
+  HasKafka: !Not [!Equals [!Ref KafkaBootstrapServers, ""]]
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
   HasTelemetryTable: !Not [!Equals [!Ref TelemetryTableName, ""]]
 
 Resources:
@@ -214,6 +246,215 @@ Resources:
         - Key: ManagedBy
           Value: cloudformation
 
+  # ── Telemetry rule: MQTT -> Kafka (optional) ─────────────────────────────────
+  # IoT reaches the private MSK brokers through a VPC rule destination (ENIs in the subnets).
+  KafkaDestinationSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasKafka
+    Properties:
+      GroupName: !Sub "${Environment}-${ProductName}-sg-iot-kafka"
+      GroupDescription: "IoT Core rule VPC destination - outbound to MSK"
+      VpcId:
+        Fn::ImportValue: !Sub "${Environment}-${ProductName}-vpc-id"
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-sg-iot-kafka"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  MskIngressFromIot:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasKafka
+    Properties:
+      GroupId:
+        Fn::ImportValue: !Sub "${Environment}-${ProductName}-msk-sg-id"
+      IpProtocol: tcp
+      FromPort: 9096
+      ToPort: 9096
+      SourceSecurityGroupId: !Ref KafkaDestinationSg
+      Description: "Kafka SASL/SCRAM from the IoT rule destination"
+
+  KafkaDestinationRole:
+    Type: AWS::IAM::Role
+    Condition: HasKafka
+    Properties:
+      RoleName: !Sub "${Environment}-${ProductName}-iot-kafka-destination-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: vpc-destination
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:CreateNetworkInterfacePermission
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeVpcAttribute
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  KafkaDestination:
+    Type: AWS::IoT::TopicRuleDestination
+    Condition: HasKafka
+    DependsOn: MskIngressFromIot
+    Properties:
+      Status: ENABLED
+      VpcProperties:
+        VpcId:
+          Fn::ImportValue: !Sub "${Environment}-${ProductName}-vpc-id"
+        SubnetIds:
+          - Fn::ImportValue: !Sub "${Environment}-${ProductName}-private-subnet-a"
+          - Fn::ImportValue: !Sub "${Environment}-${ProductName}-private-subnet-b"
+        SecurityGroups:
+          - !Ref KafkaDestinationSg
+        RoleArn: !GetAtt KafkaDestinationRole.Arn
+
+  KafkaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Condition: HasKafka
+    Properties:
+      QueueName: !Sub "${Environment}-${ProductName}-iot-kafka-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  KafkaRuleRole:
+    Type: AWS::IAM::Role
+    Condition: HasKafka
+    Properties:
+      RoleName: !Sub "${Environment}-${ProductName}-iot-kafka-rule-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: kafka-rule
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  Fn::ImportValue: !Sub "${Environment}-${ProductName}-msk-scram-secret-arn"
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource:
+                  Fn::ImportValue: !Sub "${Environment}-${ProductName}-msk-scram-key-arn"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt KafkaDeadLetterQueue.Arn
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # Key = vehicleId keeps all messages of one vehicle in the same partition (ordering).
+  KafkaRule:
+    Type: AWS::IoT::TopicRule
+    Condition: HasKafka
+    Properties:
+      TopicRulePayload:
+        RuleDisabled: false
+        AwsIotSqlVersion: "2016-03-23"
+        Sql: !Sub "SELECT *, topic(4) AS vehicleId FROM '${Environment}/${ProductName}/devices/+/telemetry'"
+        Actions:
+          - Kafka:
+              DestinationArn: !GetAtt KafkaDestination.Arn
+              Topic: !Ref KafkaTopic
+              Key: "${vehicleId}"
+              ClientProperties:
+                bootstrap.servers: !Ref KafkaBootstrapServers
+                security.protocol: SASL_SSL
+                sasl.mechanism: SCRAM-SHA-512
+                acks: all
+                compression.type: gzip
+                sasl.scram.username: !Join
+                  - ""
+                  - - "${get_secret('"
+                    - Fn::ImportValue: !Sub "${Environment}-${ProductName}-msk-scram-secret-arn"
+                    - "', 'SecretString', 'username', '"
+                    - !GetAtt KafkaRuleRole.Arn
+                    - "')}"
+                sasl.scram.password: !Join
+                  - ""
+                  - - "${get_secret('"
+                    - Fn::ImportValue: !Sub "${Environment}-${ProductName}-msk-scram-secret-arn"
+                    - "', 'SecretString', 'password', '"
+                    - !GetAtt KafkaRuleRole.Arn
+                    - "')}"
+        ErrorAction:
+          Sqs:
+            QueueUrl: !Ref KafkaDeadLetterQueue
+            RoleArn: !GetAtt KafkaRuleRole.Arn
+            UseBase64: false
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  KafkaRuleFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasKafka
+    Properties:
+      AlarmName: !Sub "${Environment}-${ProductName}-iot-kafka-rule-failure"
+      AlarmDescription: "The IoT rule could not deliver messages to Kafka - inspect the dead-letter queue"
+      Namespace: AWS/IoT
+      MetricName: Failure
+      Dimensions:
+        - Name: RuleName
+          Value: !Ref KafkaRule
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
 # =============================================================================
 # Outputs
 # =============================================================================
@@ -237,6 +478,11 @@ Outputs:
     Value: !Ref ThingGroup
     Export:
       Name: !Sub "${Environment}-${ProductName}-iot-thing-group-name"
+
+  KafkaDeadLetterQueueUrl:
+    Condition: HasKafka
+    Description: "Messages the Kafka rule failed to deliver"
+    Value: !Ref KafkaDeadLetterQueue
 
   TelemetryTopicFilter:
     Description: "MQTT topic filter the telemetry rule listens on (devices publish to the + level = their thing name)"

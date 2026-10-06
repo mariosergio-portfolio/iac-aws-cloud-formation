@@ -226,26 +226,6 @@ aws cloudformation deploy `
     DbName=$ProductName
 ```
 
-### Step 5b: DynamoDB table (optional)
-
-On-demand, encrypted table `$Environment-$ProductName-$AppServiceName-table`. Once per service. The table is
-**retained** when the stack is deleted. The stack exports a managed policy
-(`...-dynamodb-access-policy-arn`) that grants access to this table only; attach it to the service's task role.
-
-```powershell
-aws cloudformation deploy `
-  --stack-name "$StackPrefix-$AppServiceName-dynamodb" `
-  --template-file ./per-service/aws-dynamodb-stack.yml `
-  --region us-east-1 `
-  --capabilities CAPABILITY_NAMED_IAM `
-  --parameter-overrides `
-    Environment=$Environment `
-    ProductName=$ProductName `
-    AppServiceName=$AppServiceName
-# Optional: SortKeyName="" (no sort key), TtlAttributeName=expiresAt, StreamViewType=NEW_AND_OLD_IMAGES,
-#           DeletionProtection=true (prod). For IoT telemetry use SortKeyType=N.
-```
-
 ### Step 6: SSM parameter (image tag)
 
 The ECS task definition reads the image tag from SSM Parameter Store. The parameter name **starts with a
@@ -318,49 +298,6 @@ To confirm the pipeline works after a build, see [Verify the pipeline](#verify-t
 
 ---
 
-### Optional product-level stacks: IoT Core and Kafka (MSK)
-
-Deploy once per product and environment, after the VPC stack (step 1). Both are independent of the ECS stacks.
-
-**AWS IoT Core (MQTT).** The broker itself is managed by AWS; this stack creates the thing type, thing group,
-the per-device policy and, optionally, a rule that stores `<env>/<product>/devices/<thingName>/telemetry`
-messages in a DynamoDB table (deploy step 5b first with `SortKeyType=N`, then pass `TelemetryTableName`).
-
-```powershell
-aws cloudformation deploy `
-  --stack-name "$StackPrefix-iot-core" `
-  --template-file ./aws-iot-core-stack.yml `
-  --region us-east-1 `
-  --capabilities CAPABILITY_NAMED_IAM `
-  --parameter-overrides `
-    Environment=$Environment `
-    ProductName=$ProductName `
-    TelemetryTableName="$Environment-$ProductName-$AppServiceName-table"   # omit to skip the rule
-
-# MQTT endpoint for devices
-aws iot describe-endpoint --endpoint-type iot:Data-ATS --region us-east-1
-```
-
-**Amazon MSK (Kafka).** Takes about 25 minutes to create. TLS + IAM authentication, reachable only from the
-ECS tasks (`sg-ecs`). Attach the exported `...-msk-client-policy-arn` to each service's task role.
-The smallest default (2 × `kafka.t3.small`) costs roughly $65/month; set `BrokerInstanceType` for prod.
-
-```powershell
-aws cloudformation deploy `
-  --stack-name "$StackPrefix-msk" `
-  --template-file ./aws-msk-stack.yml `
-  --region us-east-1 `
-  --capabilities CAPABILITY_NAMED_IAM `
-  --parameter-overrides `
-    Environment=$Environment `
-    ProductName=$ProductName
-
-# Bootstrap brokers (IAM auth, port 9098) for the application's configuration
-$MskArn = aws cloudformation describe-stacks --stack-name "$StackPrefix-msk" --region us-east-1 `
-  --query "Stacks[0].Outputs[?OutputKey=='MskClusterArn'].OutputValue" --output text
-aws kafka get-bootstrap-brokers --cluster-arn $MskArn --region us-east-1 --query BootstrapBrokerStringSaslIam --output text
-```
-
 ## 5. Build and redeploy an image
 
 ### 5.1 Build and push a new image (via CodeBuild)
@@ -396,9 +333,9 @@ aws ecs update-service `
 
 ### Delete stacks
 
-Delete in reverse order of deployment: `ecs-service`, `pipeline`, `rds`, `dynamodb` (if deployed; the table itself is retained), `bedrock-iam-<model-label>` stacks (if deployed), `iam`, `codebuild` (per service),
-then `iot-core` and `msk` (if deployed), `ecs-infra` and `vpc` (per product). Delete `iot-core` before the DynamoDB table,
-and `msk` and `dynamodb` before `iam` if the task role has their policies attached (detach first). Example for one service stack:
+Delete in reverse order of deployment: `ecs-service`, `pipeline`, `rds`, `bedrock-iam-<model-label>` stacks (if deployed), `iam`, `codebuild` (per service),
+then `ecs-infra` and `vpc` (per product). The optional IoT / Kafka / DynamoDB stacks have their own teardown order in
+[cloud-formation-stacks/iot-async-dynamo/README.md](cloud-formation-stacks/iot-async-dynamo/README.md). Example for one service stack:
 
 ```powershell
 aws cloudformation delete-stack --stack-name "$StackPrefix-$AppServiceName-ecs-service"

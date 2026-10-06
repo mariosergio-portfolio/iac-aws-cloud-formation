@@ -11,9 +11,13 @@ Description: "Generic - Amazon MSK (managed Apache Kafka) cluster shared by a pr
 #   - MSK configuration  (auto.create.topics.enable=false, replication factor 2, 3 partitions)
 #   - Security group     ${Environment}-${ProductName}-sg-msk
 #       inbound TCP 9098 (Kafka over TLS + IAM auth) from sg-ecs ONLY, plus broker-to-broker
+#       (the IoT rule destination adds its own 9096 rule from aws-iot-core-stack.yml)
 #   - MSK cluster        ${Environment}-${ProductName}-msk
-#       TLS only (client-broker and in-cluster), IAM authentication (no passwords),
-#       EBS encrypted at rest, broker logs to CloudWatch, one broker per private subnet
+#       TLS only (client-broker and in-cluster), IAM authentication for the applications
+#       (port 9098) and SASL/SCRAM-SHA-512 for AWS IoT Core (port 9096) - the IoT Kafka action
+#       cannot use IAM auth. EBS encrypted at rest, broker logs to CloudWatch.
+#   - KMS key + Secrets Manager secret (AmazonMSK_...) holding the generated SCRAM
+#     credentials for IoT, associated to the cluster. MSK requires a customer-managed key.
 #   - Managed policy     least-privilege Kafka client access for ECS task roles
 #
 # Cost note: the default kafka.t3.small x 2 brokers is the smallest sensible dev setup
@@ -27,13 +31,19 @@ Description: "Generic - Amazon MSK (managed Apache Kafka) cluster shared by a pr
 #   - ${Environment}-${ProductName}-msk-sg-id
 #   - ${Environment}-${ProductName}-msk-client-policy-arn
 #       (attach it to the service's ECS task role)
+#   - ${Environment}-${ProductName}-msk-scram-secret-arn  (read by the IoT rule)
+#   - ${Environment}-${ProductName}-msk-scram-key-arn
 #
 # Bootstrap brokers are not a CloudFormation attribute. Read them at runtime / deploy time:
-#   aws kafka get-bootstrap-brokers --cluster-arn <cluster-arn> --query BootstrapBrokerStringSaslIam
+#   aws kafka get-bootstrap-brokers --cluster-arn <cluster-arn> --query BootstrapBrokerStringSaslIam   # apps, :9098
+#   aws kafka get-bootstrap-brokers --cluster-arn <cluster-arn> --query BootstrapBrokerStringSaslScram # IoT,  :9096
+#
+# Topics are never auto-created: create them with an admin client (IAM auth) before use.
+# For prod use NumberOfBrokerNodes=4, DefaultReplicationFactor=3, MinInsyncReplicas=2.
 #
 # Deploy:
 #   aws cloudformation deploy \
-#     --template-file cloud-formation-stacks/aws-msk-stack.yml \
+#     --template-file cloud-formation-stacks/iot-async-dynamo/aws-msk-stack.yml \
 #     --stack-name <env>-<product>-msk \
 #     --capabilities CAPABILITY_NAMED_IAM \
 #     --parameter-overrides \
@@ -82,6 +92,18 @@ Parameters:
     MaxValue: 16384
     Description: "EBS storage per broker in GiB."
 
+  DefaultReplicationFactor:
+    Type: Number
+    Default: 2
+    AllowedValues: [2, 3]
+    Description: "Default topic replication factor (3 needs NumberOfBrokerNodes >= 4)."
+
+  MinInsyncReplicas:
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 2]
+    Description: "min.insync.replicas. With acks=all, 2 survives one broker failure without losing acknowledged data (prod)."
+
   LogRetentionDays:
     Type: Number
     Default: 7
@@ -98,10 +120,10 @@ Resources:
       Description: "Topics are created explicitly, never implicitly by a client typo"
       KafkaVersionsList:
         - !Ref KafkaVersion
-      ServerProperties: |
+      ServerProperties: !Sub |
         auto.create.topics.enable=false
-        default.replication.factor=2
-        min.insync.replicas=1
+        default.replication.factor=${DefaultReplicationFactor}
+        min.insync.replicas=${MinInsyncReplicas}
         num.partitions=3
         delete.topic.enable=true
         log.retention.hours=168
@@ -178,6 +200,8 @@ Resources:
         Sasl:
           Iam:
             Enabled: true
+          Scram:
+            Enabled: true
         Unauthenticated:
           Enabled: false
       EncryptionInfo:
@@ -194,6 +218,89 @@ Resources:
         ProductName: !Ref ProductName
         Environment: !Ref Environment
         ManagedBy: cloudformation
+
+  # ── SCRAM credentials for AWS IoT Core ───────────────────────────────────────
+  # MSK only accepts SCRAM secrets that are (1) named AmazonMSK_*, (2) encrypted with a
+  # customer-managed KMS key (not the default aws/secretsmanager key).
+  ScramKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${Environment}-${ProductName} MSK SCRAM secret encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+          - Sid: MskReadsSecret
+            Effect: Allow
+            Principal:
+              Service: kafka.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+                kms:CallerAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ScramKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${Environment}-${ProductName}-msk-scram"
+      TargetKeyId: !Ref ScramKey
+
+  IotScramSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "AmazonMSK_${Environment}_${ProductName}_iot"
+      Description: "SASL/SCRAM credentials used by the AWS IoT Core Kafka rule action"
+      KmsKeyId: !Ref ScramKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"iot-ingest"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  IotScramSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref IotScramSecret
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kafka.amazonaws.com
+            Action: secretsmanager:getSecretValue
+            Resource: "*"
+
+  ScramAssociation:
+    Type: AWS::MSK::BatchScramSecret
+    DependsOn: IotScramSecretPolicy
+    Properties:
+      ClusterArn: !Ref MskCluster
+      SecretArnList:
+        - !Ref IotScramSecret
 
   # ── Kafka client access for ECS task roles ───────────────────────────────────
   MskClientPolicy:
@@ -241,6 +348,18 @@ Outputs:
     Value: !Ref SgMsk
     Export:
       Name: !Sub "${Environment}-${ProductName}-msk-sg-id"
+
+  IotScramSecretArn:
+    Description: "SCRAM secret (username + password) for the AWS IoT Core Kafka rule"
+    Value: !Ref IotScramSecret
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-msk-scram-secret-arn"
+
+  ScramKeyArn:
+    Description: "KMS key that encrypts the SCRAM secret"
+    Value: !GetAtt ScramKey.Arn
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-msk-scram-key-arn"
 
   MskClientPolicyArn:
     Description: "Managed policy granting Kafka client access - attach to the ECS task role"

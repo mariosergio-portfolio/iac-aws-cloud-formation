@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: "Generic - DynamoDB table for one microservice (deployed once per service)"
 
 # =============================================================================
-# per-service/aws-dynamodb-stack.yml
+# iot-async-dynamo/aws-dynamodb-stack.yml
 #
 # Creates:
 #   - DynamoDB table  ${Environment}-${ProductName}-${AppServiceName}-table
@@ -22,7 +22,7 @@ Description: "Generic - DynamoDB table for one microservice (deployed once per s
 #
 # Deploy:
 #   aws cloudformation deploy \
-#     --template-file cloud-formation-stacks/per-service/aws-dynamodb-stack.yml \
+#     --template-file cloud-formation-stacks/iot-async-dynamo/aws-dynamodb-stack.yml \
 #     --stack-name <env>-<product>-<service>-dynamodb \
 #     --capabilities CAPABILITY_NAMED_IAM \
 #     --parameter-overrides \
