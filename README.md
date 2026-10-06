@@ -16,10 +16,13 @@ product, environment (`dev` / `staging` / `prod`) and service.
 |---|---|
 | Network (VPC, 2 public + 2 private subnets, IGW, NAT, security groups) | `aws-vpc-stack.yml` |
 | Shared ECS cluster + internet-facing Application Load Balancer | `aws-ecs-infra-stack.yml` |
+| AWS IoT Core (managed MQTT broker): thing type/group, per-device policy, optional telemetry rule → DynamoDB (optional) | `aws-iot-core-stack.yml` |
+| Amazon MSK (managed Kafka), TLS + IAM auth, reachable from ECS tasks only (optional) | `aws-msk-stack.yml` |
 | Docker build from GitHub → ECR (immutable tags, scan on push) | `per-service/aws-codebuild-stack.yml` |
 | ECS task execution role + task role | `per-service/aws-iam-stack.yml` |
 | Amazon Bedrock invoke permissions for the task role, for any model provider (optional) | `per-service/aws-bedrock-iam-stack.yml` |
 | Aurora PostgreSQL Serverless v2, managed secret, subnet group, SG | `per-service/aws-rds-aurora-stack.yml` |
+| DynamoDB table (on-demand, encrypted, PITR) + least-privilege access policy (optional) | `per-service/aws-dynamodb-stack.yml` |
 | Task definition, ECS service, target group, ALB path rule | `per-service/aws-ecs-service-stack.yml` |
 | Auto-redeploy on every successful build (EventBridge + Lambda) | `per-service/aws-pipeline-stack.yml` |
 
@@ -142,7 +145,10 @@ docs/
 cloud-formation-stacks/
 ├── aws-vpc-stack.yml               # product tier: network
 ├── aws-ecs-infra-stack.yml         # product tier: ECS cluster + ALB
+├── aws-iot-core-stack.yml          # product tier (optional): IoT Core / MQTT
+├── aws-msk-stack.yml               # product tier (optional): MSK / Kafka
 └── per-service/
+    ├── aws-dynamodb-stack.yml      # DynamoDB table + access policy (optional)
     ├── aws-codebuild-stack.yml     # ECR + CodeBuild
     ├── aws-iam-stack.yml           # ECS roles
     ├── aws-rds-aurora-stack.yml    # Aurora PostgreSQL Serverless v2

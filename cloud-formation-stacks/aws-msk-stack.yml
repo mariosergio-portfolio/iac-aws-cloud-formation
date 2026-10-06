@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Generic - Amazon MSK (managed Apache Kafka) cluster shared by a product (deployed once per product)"
+
+# =============================================================================
+# aws-msk-stack.yml
+#
+# Creates ONE provisioned MSK cluster per product and environment, in the private
+# subnets of the product VPC.
+#
+# Creates:
+#   - MSK configuration  (auto.create.topics.enable=false, replication factor 2, 3 partitions)
+#   - Security group     ${Environment}-${ProductName}-sg-msk
+#       inbound TCP 9098 (Kafka over TLS + IAM auth) from sg-ecs ONLY, plus broker-to-broker
+#   - MSK cluster        ${Environment}-${ProductName}-msk
+#       TLS only (client-broker and in-cluster), IAM authentication (no passwords),
+#       EBS encrypted at rest, broker logs to CloudWatch, one broker per private subnet
+#   - Managed policy     least-privilege Kafka client access for ECS task roles
+#
+# Cost note: the default kafka.t3.small x 2 brokers is the smallest sensible dev setup
+# (~$65/month + storage). Use kafka.m5.large or larger for prod.
+#
+# Depends on exports from:
+#   - aws-vpc-stack.yml  (VPC, private subnets, sg-ecs)
+#
+# Exports:
+#   - ${Environment}-${ProductName}-msk-cluster-arn
+#   - ${Environment}-${ProductName}-msk-sg-id
+#   - ${Environment}-${ProductName}-msk-client-policy-arn
+#       (attach it to the service's ECS task role)
+#
+# Bootstrap brokers are not a CloudFormation attribute. Read them at runtime / deploy time:
+#   aws kafka get-bootstrap-brokers --cluster-arn <cluster-arn> --query BootstrapBrokerStringSaslIam
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file cloud-formation-stacks/aws-msk-stack.yml \
+#     --stack-name <env>-<product>-msk \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides \
+#         ProductName=my-product \
+#         Environment=dev \
+#     --region us-east-1
+# =============================================================================
+
+Parameters:
+
+  ProductName:
+    Type: String
+    Description: "Product name - must match the prefix used in aws-vpc-stack exports."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment."
+
+  KafkaVersion:
+    Type: String
+    Default: "3.6.0"
+    Description: "Apache Kafka version (must be a version supported by MSK in the region)."
+
+  BrokerInstanceType:
+    Type: String
+    Default: kafka.t3.small
+    AllowedValues:
+      - kafka.t3.small
+      - kafka.m5.large
+      - kafka.m5.xlarge
+      - kafka.m5.2xlarge
+    Description: "Broker instance type. kafka.t3.small for dev/test, kafka.m5.large or larger for prod."
+
+  NumberOfBrokerNodes:
+    Type: Number
+    Default: 2
+    AllowedValues: [2, 4, 6]
+    Description: "Total brokers; must be a multiple of the number of subnets (2). Use 4+ for prod."
+
+  BrokerVolumeSizeGiB:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 16384
+    Description: "EBS storage per broker in GiB."
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 180, 365]
+    Description: "Retention of the broker log group (7 dev/test, 30 prod)."
+
+Resources:
+
+  # ── Cluster configuration ────────────────────────────────────────────────────
+  MskConfiguration:
+    Type: AWS::MSK::Configuration
+    Properties:
+      Name: !Sub "${Environment}-${ProductName}-msk-config"
+      Description: "Topics are created explicitly, never implicitly by a client typo"
+      KafkaVersionsList:
+        - !Ref KafkaVersion
+      ServerProperties: |
+        auto.create.topics.enable=false
+        default.replication.factor=2
+        min.insync.replicas=1
+        num.partitions=3
+        delete.topic.enable=true
+        log.retention.hours=168
+
+  # ── Security group ───────────────────────────────────────────────────────────
+  SgMsk:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${Environment}-${ProductName}-sg-msk"
+      GroupDescription: "MSK brokers - Kafka IAM/TLS (9098) from ECS tasks only"
+      VpcId:
+        Fn::ImportValue: !Sub "${Environment}-${ProductName}-vpc-id"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9098
+          ToPort: 9098
+          SourceSecurityGroupId:
+            Fn::ImportValue: !Sub "${Environment}-${ProductName}-sg-ecs-id"
+          Description: "Kafka TLS + IAM auth from ECS tasks"
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProductName}-sg-msk"
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # Broker-to-broker traffic (replication) - separate resource avoids a self-reference cycle.
+  SgMskSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgMsk
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref SgMsk
+      Description: "Broker-to-broker"
+
+  # ── Broker logs ──────────────────────────────────────────────────────────────
+  BrokerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/msk/${Environment}-${ProductName}-msk"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── MSK cluster ──────────────────────────────────────────────────────────────
+  MskCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: !Sub "${Environment}-${ProductName}-msk"
+      KafkaVersion: !Ref KafkaVersion
+      NumberOfBrokerNodes: !Ref NumberOfBrokerNodes
+      BrokerNodeGroupInfo:
+        InstanceType: !Ref BrokerInstanceType
+        ClientSubnets:
+          - Fn::ImportValue: !Sub "${Environment}-${ProductName}-private-subnet-a"
+          - Fn::ImportValue: !Sub "${Environment}-${ProductName}-private-subnet-b"
+        SecurityGroups:
+          - !Ref SgMsk
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: !Ref BrokerVolumeSizeGiB
+      ConfigurationInfo:
+        Arn: !Ref MskConfiguration
+        Revision: !GetAtt MskConfiguration.LatestRevision.Revision
+      ClientAuthentication:
+        Sasl:
+          Iam:
+            Enabled: true
+        Unauthenticated:
+          Enabled: false
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+      EnhancedMonitoring: DEFAULT
+      LoggingInfo:
+        BrokerLogs:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup: !Ref BrokerLogGroup
+      Tags:
+        ProductName: !Ref ProductName
+        Environment: !Ref Environment
+        ManagedBy: cloudformation
+
+  # ── Kafka client access for ECS task roles ───────────────────────────────────
+  MskClientPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${Environment}-${ProductName}-msk-client-policy"
+      Description: !Sub "Connect, produce and consume on ${Environment}-${ProductName}-msk (IAM auth)"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - kafka-cluster:Connect
+              - kafka-cluster:DescribeCluster
+            Resource: !Ref MskCluster
+          - Effect: Allow
+            Action:
+              - kafka-cluster:DescribeTopic
+              - kafka-cluster:ReadData
+              - kafka-cluster:WriteData
+            Resource: !Sub "arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${Environment}-${ProductName}-msk/*"
+          - Effect: Allow
+            Action:
+              - kafka-cluster:AlterGroup
+              - kafka-cluster:DescribeGroup
+            Resource: !Sub "arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:group/${Environment}-${ProductName}-msk/*"
+          - Effect: Allow
+            Action: kafka:GetBootstrapBrokers
+            Resource: !Ref MskCluster
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+
+  MskClusterArn:
+    Description: "MSK cluster ARN"
+    Value: !Ref MskCluster
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-msk-cluster-arn"
+
+  SgMskId:
+    Description: "MSK security group ID"
+    Value: !Ref SgMsk
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-msk-sg-id"
+
+  MskClientPolicyArn:
+    Description: "Managed policy granting Kafka client access - attach to the ECS task role"
+    Value: !Ref MskClientPolicy
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-msk-client-policy-arn"

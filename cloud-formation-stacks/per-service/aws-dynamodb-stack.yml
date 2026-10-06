@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Generic - DynamoDB table for one microservice (deployed once per service)"
+
+# =============================================================================
+# per-service/aws-dynamodb-stack.yml
+#
+# Creates:
+#   - DynamoDB table  ${Environment}-${ProductName}-${AppServiceName}-table
+#       * on-demand billing (PAY_PER_REQUEST), encryption at rest (AWS managed KMS key)
+#       * partition key (+ optional sort key), optional TTL attribute, optional stream
+#       * point-in-time recovery, optional deletion protection
+#   - Managed policy that grants read/write on THIS table only
+#
+# The table is never deleted with the stack (DeletionPolicy: Retain) - DynamoDB has
+# no final-snapshot mechanism like Aurora, so Retain is the data-safety equivalent.
+#
+# Exports:
+#   - ${Environment}-${ProductName}-${AppServiceName}-dynamodb-table-name
+#   - ${Environment}-${ProductName}-${AppServiceName}-dynamodb-table-arn
+#   - ${Environment}-${ProductName}-${AppServiceName}-dynamodb-access-policy-arn
+#       (attach it to the service's ECS task role to let the application use the table)
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file cloud-formation-stacks/per-service/aws-dynamodb-stack.yml \
+#     --stack-name <env>-<product>-<service>-dynamodb \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides \
+#         ProductName=my-product \
+#         AppServiceName=my-service \
+#         Environment=dev \
+#     --region us-east-1
+# =============================================================================
+
+Parameters:
+
+  ProductName:
+    Type: String
+    Description: "Product name - used to name and tag all resources."
+
+  AppServiceName:
+    Type: String
+    Description: "Microservice name - namespaces the table."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment."
+
+  PartitionKeyName:
+    Type: String
+    Default: pk
+    Description: "Partition (hash) key attribute name."
+
+  PartitionKeyType:
+    Type: String
+    Default: S
+    AllowedValues: [S, N, B]
+    Description: "Partition key type: S = string, N = number, B = binary."
+
+  SortKeyName:
+    Type: String
+    Default: sk
+    Description: "Sort (range) key attribute name. Leave empty for a table with only a partition key."
+
+  SortKeyType:
+    Type: String
+    Default: S
+    AllowedValues: [S, N, B]
+    Description: "Sort key type: S = string, N = number, B = binary."
+
+  TtlAttributeName:
+    Type: String
+    Default: ""
+    Description: "Attribute holding the expiry time (epoch seconds). Leave empty to disable TTL."
+
+  StreamViewType:
+    Type: String
+    Default: NONE
+    AllowedValues: [NONE, KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES]
+    Description: "DynamoDB Streams view type. NONE disables the stream."
+
+  PointInTimeRecovery:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Continuous backups (restore to any second in the last 35 days)."
+
+  DeletionProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Prevent accidental table deletion. Set to true for prod."
+
+Conditions:
+  HasSortKey: !Not [!Equals [!Ref SortKeyName, ""]]
+  HasTtl: !Not [!Equals [!Ref TtlAttributeName, ""]]
+  HasStream: !Not [!Equals [!Ref StreamViewType, NONE]]
+
+Resources:
+
+  # ── DynamoDB table ───────────────────────────────────────────────────────────
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${Environment}-${ProductName}-${AppServiceName}-table"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: !Ref PartitionKeyName
+          AttributeType: !Ref PartitionKeyType
+        - !If
+          - HasSortKey
+          - AttributeName: !Ref SortKeyName
+            AttributeType: !Ref SortKeyType
+          - !Ref AWS::NoValue
+      KeySchema:
+        - AttributeName: !Ref PartitionKeyName
+          KeyType: HASH
+        - !If
+          - HasSortKey
+          - AttributeName: !Ref SortKeyName
+            KeyType: RANGE
+          - !Ref AWS::NoValue
+      TimeToLiveSpecification: !If
+        - HasTtl
+        - AttributeName: !Ref TtlAttributeName
+          Enabled: true
+        - !Ref AWS::NoValue
+      StreamSpecification: !If
+        - HasStream
+        - StreamViewType: !Ref StreamViewType
+        - !Ref AWS::NoValue
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref PointInTimeRecovery
+      DeletionProtectionEnabled: !Ref DeletionProtection
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: AppServiceName
+          Value: !Ref AppServiceName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Least-privilege access to this table (attach to the ECS task role) ───────
+  TableAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${Environment}-${ProductName}-${AppServiceName}-dynamodb-access"
+      Description: !Sub "Read/write access to ${Environment}-${ProductName}-${AppServiceName}-table only"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:DescribeTable
+              - dynamodb:GetItem
+              - dynamodb:BatchGetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:BatchWriteItem
+            Resource:
+              - !GetAtt Table.Arn
+              - !Sub "${Table.Arn}/index/*"
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+
+  TableName:
+    Description: "DynamoDB table name"
+    Value: !Ref Table
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-dynamodb-table-name"
+
+  TableArn:
+    Description: "DynamoDB table ARN"
+    Value: !GetAtt Table.Arn
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-dynamodb-table-arn"
+
+  TableAccessPolicyArn:
+    Description: "Managed policy granting access to this table - attach to the ECS task role"
+    Value: !Ref TableAccessPolicy
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-${AppServiceName}-dynamodb-access-policy-arn"

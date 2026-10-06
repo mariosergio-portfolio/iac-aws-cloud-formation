@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Generic - AWS IoT Core (MQTT broker) device registry, device policy and telemetry rule for a product"
+
+# =============================================================================
+# aws-iot-core-stack.yml
+#
+# AWS IoT Core is a fully managed MQTT broker: there is no VPC, cluster or broker
+# to provision. The broker endpoint is account/region level; this stack creates
+# what a product needs on top of it.
+#
+# Creates:
+#   - Thing Type   ${Environment}-${ProductName}-device
+#   - Thing Group  ${Environment}-${ProductName}-devices
+#   - IoT Policy   ${Environment}-${ProductName}-iot-device-policy
+#       A device (certificate attached to a Thing, MQTT client id = thing name) may only:
+#         connect as itself
+#         publish  to  <env>/<product>/devices/<thingName>/*
+#         subscribe/receive on <env>/<product>/devices/<thingName>/commands/*
+#   - (optional) Topic Rule: <env>/<product>/devices/+/telemetry  ->  DynamoDB table
+#       deviceId (topic segment 4) is stored in the partition key, the arrival time
+#       (epoch ms) in the sort key. Enabled when TelemetryTableName is not empty.
+#       Failed actions are written to a CloudWatch log group.
+#
+# Topic convention:
+#   <env>/<product>/devices/<thingName>/telemetry     device -> cloud
+#   <env>/<product>/devices/<thingName>/commands/...  cloud  -> device
+#
+# Devices are NOT created here (they are provisioned per device/fleet). To onboard one:
+#   aws iot create-thing --thing-name <thingName> --thing-type-name <env>-<product>-device
+#   aws iot create-keys-and-certificate --set-as-active ...
+#   aws iot attach-policy --policy-name <env>-<product>-iot-device-policy --target <certArn>
+#   aws iot attach-thing-principal --thing-name <thingName> --principal <certArn>
+# The MQTT endpoint is:  aws iot describe-endpoint --endpoint-type iot:Data-ATS
+#
+# Exports:
+#   - ${Environment}-${ProductName}-iot-device-policy-name
+#   - ${Environment}-${ProductName}-iot-thing-type-name
+#   - ${Environment}-${ProductName}-iot-thing-group-name
+#
+# Deploy:
+#   aws cloudformation deploy \
+#     --template-file cloud-formation-stacks/aws-iot-core-stack.yml \
+#     --stack-name <env>-<product>-iot-core \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides \
+#         ProductName=my-product \
+#         Environment=dev \
+#         TelemetryTableName=dev-my-product-my-service-table \
+#     --region us-east-1
+# =============================================================================
+
+Parameters:
+
+  ProductName:
+    Type: String
+    Description: "Product name - used to name and tag all resources and as the MQTT topic prefix."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment."
+
+  TelemetryTableName:
+    Type: String
+    Default: ""
+    Description: >
+      Name of an existing DynamoDB table (see per-service/aws-dynamodb-stack.yml) that receives
+      device telemetry. Leave empty to skip the topic rule.
+
+  TelemetryPartitionKeyName:
+    Type: String
+    Default: pk
+    Description: "Partition key attribute of the telemetry table (String). Receives the device id."
+
+  TelemetrySortKeyName:
+    Type: String
+    Default: sk
+    Description: "Sort key attribute of the telemetry table (Number - the table must be deployed with SortKeyType=N). Receives the arrival time in epoch ms."
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 180, 365]
+    Description: "Retention of the IoT rule error log group (7 dev/test, 30 prod)."
+
+Conditions:
+  HasTelemetryTable: !Not [!Equals [!Ref TelemetryTableName, ""]]
+
+Resources:
+
+  # ── Device registry ──────────────────────────────────────────────────────────
+  ThingType:
+    Type: AWS::IoT::ThingType
+    Properties:
+      ThingTypeName: !Sub "${Environment}-${ProductName}-device"
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub "${Environment}-${ProductName}-devices"
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Device policy (attach to each device certificate) ────────────────────────
+  # ${!iot:Connection.Thing.ThingName} is an IoT policy variable (the "!" stops
+  # CloudFormation from substituting it). It requires client id = thing name and
+  # the certificate attached to that thing.
+  DevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub "${Environment}-${ProductName}-iot-device-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: iot:Connect
+            Resource: !Sub "arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:client/${!iot:Connection.Thing.ThingName}"
+          - Effect: Allow
+            Action: iot:Publish
+            Resource: !Sub "arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/${Environment}/${ProductName}/devices/${!iot:Connection.Thing.ThingName}/*"
+          - Effect: Allow
+            Action: iot:Subscribe
+            Resource: !Sub "arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${Environment}/${ProductName}/devices/${!iot:Connection.Thing.ThingName}/commands/*"
+          - Effect: Allow
+            Action: iot:Receive
+            Resource: !Sub "arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/${Environment}/${ProductName}/devices/${!iot:Connection.Thing.ThingName}/commands/*"
+
+  # ── Telemetry rule: MQTT -> DynamoDB (optional) ──────────────────────────────
+  RuleErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasTelemetryTable
+    Properties:
+      LogGroupName: !Sub "/iot/${Environment}-${ProductName}-rule-errors"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TelemetryRuleRole:
+    Type: AWS::IAM::Role
+    Condition: HasTelemetryTable
+    Properties:
+      RoleName: !Sub "${Environment}-${ProductName}-iot-rule-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: telemetry-rule
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TelemetryTableName}"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${RuleErrorLogGroup.Arn}:*"
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TelemetryRule:
+    Type: AWS::IoT::TopicRule
+    Condition: HasTelemetryTable
+    Properties:
+      TopicRulePayload:
+        RuleDisabled: false
+        AwsIotSqlVersion: "2016-03-23"
+        Sql: !Sub "SELECT *, topic(4) AS ${TelemetryPartitionKeyName}, timestamp() AS ${TelemetrySortKeyName} FROM '${Environment}/${ProductName}/devices/+/telemetry'"
+        Actions:
+          - DynamoDBv2:
+              PutItem:
+                TableName: !Ref TelemetryTableName
+              RoleArn: !GetAtt TelemetryRuleRole.Arn
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Ref RuleErrorLogGroup
+            RoleArn: !GetAtt TelemetryRuleRole.Arn
+      Tags:
+        - Key: ProductName
+          Value: !Ref ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+
+  DevicePolicyName:
+    Description: "IoT policy to attach to every device certificate"
+    Value: !Ref DevicePolicy
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-iot-device-policy-name"
+
+  ThingTypeName:
+    Description: "Thing type for the product's devices"
+    Value: !Ref ThingType
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-iot-thing-type-name"
+
+  ThingGroupName:
+    Description: "Thing group for the product's devices"
+    Value: !Ref ThingGroup
+    Export:
+      Name: !Sub "${Environment}-${ProductName}-iot-thing-group-name"
+
+  TelemetryTopicFilter:
+    Description: "MQTT topic filter the telemetry rule listens on (devices publish to the + level = their thing name)"
+    Value: !Sub "${Environment}/${ProductName}/devices/+/telemetry"
